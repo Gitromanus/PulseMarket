@@ -21,6 +21,15 @@ def _viewport(page: Any) -> dict[str, int]:
     return page.viewport_size or {"width": 1280, "height": 800}
 
 
+def cursor(page: Any) -> tuple[float, float] | None:
+    """Последняя позиция виртуального курсора (CSS-пиксели viewport)."""
+    return _MOUSE.get(id(page))
+
+
+def set_cursor(page: Any, x: float, y: float) -> None:
+    _MOUSE[id(page)] = (float(x), float(y))
+
+
 async def pause(lo: float = 0.25, hi: float = 0.9) -> float:
     delay = random.uniform(lo, hi)
     await asyncio.sleep(delay)
@@ -79,10 +88,10 @@ async def move(page: Any, x: float, y: float) -> None:
         eased = t * t * (3 - 2 * t)
         px = (1 - eased) ** 2 * start_x + 2 * (1 - eased) * eased * ctrl_x + eased**2 * x
         py = (1 - eased) ** 2 * start_y + 2 * (1 - eased) * eased * ctrl_y + eased**2 * y
-        await page.mouse.move(
-            px + random.uniform(-1.2, 1.2),
-            py + random.uniform(-1.2, 1.2),
-        )
+        jx = px + random.uniform(-1.2, 1.2)
+        jy = py + random.uniform(-1.2, 1.2)
+        await page.mouse.move(jx, jy)
+        _MOUSE[key] = (jx, jy)
         await asyncio.sleep(duration / steps * random.uniform(0.7, 1.4))
 
     _MOUSE[key] = (x, y)

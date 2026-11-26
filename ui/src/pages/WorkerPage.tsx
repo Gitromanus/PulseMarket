@@ -198,7 +198,8 @@ function BrowserPreview({
 
   useEffect(() => {
     if (!polling) return;
-    const timer = window.setInterval(() => setTick((value) => value + 1), 2500);
+    // 700 мс: курсор в превью успевает «двигаться», а не прыгать раз в 2.5 с.
+    const timer = window.setInterval(() => setTick((value) => value + 1), 700);
     return () => window.clearInterval(timer);
   }, [polling]);
 

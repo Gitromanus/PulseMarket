@@ -334,11 +334,10 @@ async def _search_like_human(
         await _dismiss_overlays(page, bus, thread_id)
         await human.pause(1.2, 2.8)
         try:
-            await page.mouse.move(
-                random.randint(140, 1150),
-                random.randint(120, 620),
-                steps=random.randint(10, 22),
-            )
+            cursor_x = random.randint(140, 1150)
+            cursor_y = random.randint(120, 620)
+            await page.mouse.move(cursor_x, cursor_y, steps=random.randint(10, 22))
+            human.set_cursor(page, cursor_x, cursor_y)
         except Exception:  # noqa: BLE001
             pass
         await human.pause(0.4, 1.2)
