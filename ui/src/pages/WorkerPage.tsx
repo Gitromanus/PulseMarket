@@ -156,7 +156,25 @@ export default function WorkerPage(props: Props) {
         </button>
       </div>
 
-      {sub === "log" ? <LogView logs={logs} /> : <ResultsTable runs={runs} />}
+      {sub === "log" ? (
+        <LogView logs={logs} />
+      ) : (
+        <div>
+          <div className="subtabs results-toolbar">
+            <span className="muted">Результаты прогонов: {runs.length}</span>
+            <button
+              className="btn small ghost"
+              style={{ marginLeft: "auto" }}
+              onClick={props.onClearLogs}
+              disabled={logs.length === 0}
+              title="Очистить историю логов (журнал ядра тоже)"
+            >
+              Очистить логи
+            </button>
+          </div>
+          <ResultsTable runs={runs} />
+        </div>
+      )}
 
       {dialog && (
         <Modal

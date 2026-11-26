@@ -864,6 +864,35 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                 />
               </Field>
             </div>
+            <div className="row3">
+              <Field label="Интервал старта потоков, сек" hint="0 — все сразу">
+                <input
+                  type="number"
+                  min={0}
+                  max={600}
+                  value={settings.general.thread_start_interval_sec}
+                  onChange={(e) => setGeneral("thread_start_interval_sec", Number(e.target.value))}
+                />
+              </Field>
+              <Field label="Пауза между карточками, от" hint="секунд">
+                <input
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={settings.general.task_gap_min_sec}
+                  onChange={(e) => setGeneral("task_gap_min_sec", Number(e.target.value))}
+                />
+              </Field>
+              <Field label="Пауза между карточками, до" hint="секунд">
+                <input
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={settings.general.task_gap_max_sec}
+                  onChange={(e) => setGeneral("task_gap_max_sec", Number(e.target.value))}
+                />
+              </Field>
+            </div>
           </fieldset>
 
           <fieldset className="panel">

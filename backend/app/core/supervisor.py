@@ -208,7 +208,14 @@ class Supervisor:
         await self.bus.log(None, f"Запуск прогона: потоков {threads}, заданий в очереди {pending}")
 
         self._workers = [
-            asyncio.create_task(self._worker(i, settings), name=f"worker-{i}")
+            asyncio.create_task(
+                self._worker(
+                    i,
+                    settings,
+                    start_delay=(i - 1) * settings.general.thread_start_interval_sec,
+                ),
+                name=f"worker-{i}",
+            )
             for i in range(1, threads + 1)
         ]
         self._watchdog = asyncio.create_task(self._watchdog_loop(), name="watchdog")
@@ -272,10 +279,17 @@ class Supervisor:
 
     # ---------- воркер ----------
 
-    async def _worker(self, thread_id: int, settings: AppSettings) -> None:
+    async def _worker(
+        self, thread_id: int, settings: AppSettings, start_delay: float = 0.0
+    ) -> None:
         state = self.threads[thread_id]
         state["status"] = "waiting"
         await self._publish_thread(thread_id)
+        if start_delay > 0:
+            await self.bus.log(
+                thread_id, f"Старт потока через {start_delay:.0f} с (интервал запуска)"
+            )
+            await asyncio.sleep(start_delay)
 
         while not self._stop.is_set():
             lease_minutes = max(30, int(settings.general.repeat_cooldown_min) + 15)
@@ -432,9 +446,13 @@ class Supervisor:
             # Не открываем следующую карточку в ту же секунду: у человека
             # между товарами есть пауза, а мгновенный рестарт — явный паттерн.
             if not self._stop.is_set() and await self.db.count_pending() > 0:
-                gap = random.uniform(20, 70)
-                await self.bus.log(thread_id, f"Пауза между карточками {gap:.0f} с")
-                await asyncio.sleep(gap)
+                gap = random.uniform(
+                    settings.general.task_gap_min_sec,
+                    settings.general.task_gap_max_sec,
+                )
+                if gap > 0:
+                    await self.bus.log(thread_id, f"Пауза между карточками {gap:.0f} с")
+                    await asyncio.sleep(gap)
 
         state["status"] = "idle"
         await self._publish_thread(thread_id)

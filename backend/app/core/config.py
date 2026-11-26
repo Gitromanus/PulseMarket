@@ -98,6 +98,11 @@ class GeneralSettings(BaseModel):
     dir_done: str = ""
     dir_noauth: str = ""
     threads: int = Field(default=4, ge=1, le=64)
+    # Задержка между запуском потоков: снижает одновременный залп браузеров.
+    thread_start_interval_sec: int = Field(default=0, ge=0, le=600)
+    # Пауза между карточками внутри потока (случайная в этих границах).
+    task_gap_min_sec: int = Field(default=20, ge=0, le=3600)
+    task_gap_max_sec: int = Field(default=70, ge=0, le=3600)
     repeat_limit: int = Field(default=0, ge=0)
     # Пауза перед повторным заходом в ту же строку. По умолчанию выключена:
     # каждый прогон идёт с нового профиля и прокси, поэтому смысла ждать нет.
@@ -108,6 +113,12 @@ class GeneralSettings(BaseModel):
     schedule_enabled: bool = False
     schedule_interval_min: int = Field(default=60, ge=5, le=1440)
     quick_actions: QuickActions = Field(default_factory=QuickActions)
+
+    @model_validator(mode="after")
+    def _check_gap(self) -> "GeneralSettings":
+        if self.task_gap_max_sec < self.task_gap_min_sec:
+            raise ValueError("task_gap_max_sec: максимум должен быть >= минимума")
+        return self
 
 
 class ViewSettings(BaseModel):
