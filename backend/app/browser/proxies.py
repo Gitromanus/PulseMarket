@@ -63,7 +63,9 @@ class ProxyPool:
     path: str | None = None
     items: list[Proxy] = field(default_factory=list)
     invalid: int = 0
-    _busy: set[str] = field(default_factory=set)
+    # Сколько потоков одновременно может использовать один и тот же прокси.
+    max_per_proxy: int = 1
+    _busy: dict[str, int] = field(default_factory=dict)
     _cursor: int = 0
 
     def __post_init__(self) -> None:
@@ -103,32 +105,43 @@ class ProxyPool:
         total = len(self.items)
         if total == 0:
             return None
+        limit = max(1, self.max_per_proxy)
         if preferred:
             chosen = self.find(preferred)
-            if chosen is None or chosen.raw in self._busy:
+            if chosen is None or self._busy.get(chosen.raw, 0) >= limit:
                 return None
-            self._busy.add(chosen.raw)
+            self._busy[chosen.raw] = self._busy.get(chosen.raw, 0) + 1
             return chosen
         for step in range(total):
             index = (self._cursor + step) % total
             chosen = self.items[index]
-            if chosen.raw in self._busy:
+            if self._busy.get(chosen.raw, 0) >= limit:
                 continue
             self._cursor = (index + 1) % total
-            self._busy.add(chosen.raw)
+            self._busy[chosen.raw] = self._busy.get(chosen.raw, 0) + 1
             return chosen
         return None
 
     def release(self, proxy: Proxy | None) -> None:
-        if proxy is not None:
-            self._busy.discard(proxy.raw)
+        if proxy is None:
+            return
+        count = self._busy.get(proxy.raw, 0) - 1
+        if count > 0:
+            self._busy[proxy.raw] = count
+        else:
+            self._busy.pop(proxy.raw, None)
+
+    def clear_leases(self) -> None:
+        """Сбрасывает занятость перед новым прогоном (на случай зависших lease)."""
+        self._busy.clear()
 
     def state(self) -> dict:
         return {
             "total": self.size,
-            "busy": len(self._busy),
+            "busy": sum(self._busy.values()),
             "invalid": self.invalid,
             "file": self.path or "",
+            "max_per_proxy": self.max_per_proxy,
         }
 
 

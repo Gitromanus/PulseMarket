@@ -864,6 +864,18 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                 />
               </Field>
             </div>
+            <Field
+              label="Потоков на один прокси"
+              hint="сколько потоков могут одновременно работать через один IP; 1 — не делить"
+            >
+              <input
+                type="number"
+                min={1}
+                max={64}
+                value={settings.general.proxy_max_threads}
+                onChange={(e) => setGeneral("proxy_max_threads", Number(e.target.value))}
+              />
+            </Field>
             <div className="row3">
               <Field label="Интервал старта потоков, сек" hint="0 — все сразу">
                 <input

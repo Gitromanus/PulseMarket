@@ -65,6 +65,7 @@ export type Settings = {
     dir_done: string;
     dir_noauth: string;
     threads: number;
+    proxy_max_threads: number;
     thread_start_interval_sec: number;
     task_gap_min_sec: number;
     task_gap_max_sec: number;

@@ -98,6 +98,8 @@ class GeneralSettings(BaseModel):
     dir_done: str = ""
     dir_noauth: str = ""
     threads: int = Field(default=4, ge=1, le=64)
+    # Сколько потоков одновременно может работать через один прокси.
+    proxy_max_threads: int = Field(default=1, ge=1, le=64)
     # Задержка между запуском потоков: снижает одновременный залп браузеров.
     thread_start_interval_sec: int = Field(default=0, ge=0, le=600)
     # Пауза между карточками внутри потока (случайная в этих границах).

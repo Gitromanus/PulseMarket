@@ -154,6 +154,8 @@ class Supervisor:
             proxies_path = settings.general.proxies_file or None
             if self._proxies is None or self._proxies.path != proxies_path:
                 self._proxies = ProxyPool(proxies_path)
+            self._proxies.max_per_proxy = max(1, int(settings.general.proxy_max_threads))
+            self._proxies.clear_leases()
             self._provider = build_provider(settings.browser)
             profile_state = self._profiles.state()
             await self.bus.log(

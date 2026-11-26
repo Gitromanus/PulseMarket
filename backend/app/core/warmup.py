@@ -119,6 +119,7 @@ class WarmupManager:
     async def _run(self, settings: AppSettings, profiles: list[Profile]) -> None:
         provider: BrowserProvider | None = None
         pool = ProxyPool(settings.general.proxies_file or None)
+        pool.max_per_proxy = max(1, int(settings.general.proxy_max_threads))
         assignments = ProxyAssignments()
         try:
             provider = build_provider(settings.browser)
