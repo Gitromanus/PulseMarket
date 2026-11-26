@@ -202,6 +202,15 @@ class Supervisor:
             self._proxies = None
             self._provider = None
 
+        if pending < threads:
+            await self.bus.log(
+                None,
+                f"Потоков {threads}, а заданий в очереди {pending}: одновременно "
+                f"смогут работать не более {pending} потоков. Повторы одной строки "
+                "идут последовательно — добавьте строки в таблицу.",
+                "warn",
+            )
+
         self.threads = {
             i: {"id": i, "status": "idle", "task_id": None, "browser_visible": False}
             for i in range(1, threads + 1)
@@ -293,6 +302,7 @@ class Supervisor:
             )
             await asyncio.sleep(start_delay)
 
+        waiting_logged = False
         while not self._stop.is_set():
             lease_minutes = max(30, int(settings.general.repeat_cooldown_min) + 15)
             task = await self.db.claim_task(f"thread-{thread_id}", lease_minutes=lease_minutes)
@@ -303,8 +313,16 @@ class Supervisor:
                 if state["status"] != "waiting":
                     state["status"] = "waiting"
                     await self._publish_thread(thread_id)
+                if not waiting_logged:
+                    await self.bus.log(
+                        thread_id,
+                        "Свободных строк нет — жду, пока другой поток освободит задание",
+                        "warn",
+                    )
+                    waiting_logged = True
                 await asyncio.sleep(2)
                 continue
+            waiting_logged = False
 
             # Пауза повтора — на уровне задания, а не потока: иначе второй
             # поток сразу подхватит ту же строку и обойдёт кулдаун.
