@@ -25,6 +25,21 @@ from ..flows.base import ScenarioError
 from ..flows.check import run_check
 from ..flows.ozon import run_ozon
 
+# Ошибки сети/прокси на первой навигации: задание не валим, а один раз
+# повторяем с другим прокси после короткой паузы.
+PROXY_RETRY_MARKERS = ("net::err_failed", "net::err_http_response_code_failure")
+PROXY_RETRY_PAUSE = (10.0, 20.0)
+
+
+def _is_proxy_network_error(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in PROXY_RETRY_MARKERS)
+
+
+def _short_error(exc: Exception) -> str:
+    return str(exc).splitlines()[0][:160]
+
+
 PRODUCT_VIEW_STEPS = [
     ("установили геолокацию", 0.4),
     ("открыли главную маркетплейса", 0.6),
@@ -434,7 +449,6 @@ class Supervisor:
     ) -> tuple[int | None, int, int]:
         """Реальный браузер: Ozon-сценарий для маркетплейса, иначе проверочная страница."""
         assert self._profiles is not None and self._proxies is not None
-        assert self._provider is not None
 
         profile = None
         allow_ephemeral = settings.view.profile_use_pct < 100
@@ -453,6 +467,50 @@ class Supervisor:
             await asyncio.sleep(1)
         if profile is None:
             raise RuntimeError("нет свободного прогретого профиля: уменьшите число потоков")
+
+        try:
+            for attempt in (1, 2):
+                try:
+                    return await self._run_browser_once(
+                        thread_id, task, settings, steps, state, profile
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if attempt >= 2 or not _is_proxy_network_error(str(exc)):
+                        raise
+                    # Профиль остаётся тем же, меняем только закреплённый прокси.
+                    failed_raw = self._assignments.get(profile.id)
+                    new_proxy = self._assignments.reassign(
+                        profile.id,
+                        self._proxies,
+                        avoid={failed_raw} if failed_raw else set(),
+                    )
+                    changed = bool(new_proxy and new_proxy.raw != failed_raw)
+                    pause = random.uniform(*PROXY_RETRY_PAUSE)
+                    await self.bus.log(
+                        thread_id,
+                        f"Сетевая ошибка прокси ({_short_error(exc)}). "
+                        f"Повторяем через {pause:.0f} с "
+                        + ("с другим прокси" if changed else "с тем же прокси (других нет)"),
+                        "warn",
+                    )
+                    await asyncio.sleep(pause)
+        finally:
+            self._profiles.release(profile)
+            state.update({"profile": None, "proxy": None, "hwnd": None, "browser_visible": False})
+            await self._publish_thread(thread_id)
+
+    async def _run_browser_once(
+        self,
+        thread_id: int,
+        task: dict[str, Any],
+        settings: AppSettings,
+        steps: list[dict[str, Any]],
+        state: dict[str, Any],
+        profile: Any,
+    ) -> tuple[int | None, int, int]:
+        """Один заход в браузер с закреплённым за профилем прокси."""
+        assert self._proxies is not None and self._provider is not None
+
         # Прокси закреплён за профилем: новый прогон = новый профиль со своим
         # постоянным IP, а не тот же профиль с прыгающим адресом.
         proxy = None
@@ -475,7 +533,6 @@ class Supervisor:
                 if proxy is not None:
                     break
             if proxy is None:
-                self._profiles.release(profile)
                 raise RuntimeError(
                     "нет свободных прокси: уменьшите число потоков или расширьте пул"
                 )
@@ -553,11 +610,8 @@ class Supervisor:
                 except asyncio.CancelledError:
                     pass
             self.sessions.pop(thread_id, None)
-            # Освобождаем прокси и профиль сразу после прогона: следующий
-            # прогон возьмёт из пула уже другие.
             if proxy is not None:
                 self._proxies.release(proxy)
-            self._profiles.release(profile)
             state.update({"profile": None, "proxy": None, "hwnd": None, "browser_visible": False})
             await self._publish_thread(thread_id)
 

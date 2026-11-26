@@ -200,6 +200,23 @@ class ProxyAssignments:
             self._save(data)
             return len(profile_ids)
 
+    def reassign(self, profile_id: str, pool: ProxyPool, avoid: set[str] | None = None) -> Proxy | None:
+        """Меняет прокси профиля на самый свободный, по возможности не из avoid."""
+        if pool.size == 0:
+            return None
+        avoid = avoid or set()
+        with _ASSIGN_LOCK:
+            data = self._load()
+            profiles: dict[str, str] = data["profiles"]
+            profiles.pop(profile_id, None)
+            pool_raws = {proxy.raw for proxy in pool.items}
+            counts = Counter(raw for raw in profiles.values() if raw in pool_raws)
+            candidates = [proxy for proxy in pool.items if proxy.raw not in avoid] or list(pool.items)
+            chosen = min(candidates, key=lambda proxy: (counts.get(proxy.raw, 0), proxy.raw))
+            profiles[profile_id] = chosen.raw
+            self._save(data)
+            return chosen
+
     @staticmethod
     def _load() -> dict:
         path = assignments_path()
