@@ -1,0 +1,32 @@
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / Electron
+ui/node_modules/
+ui/dist/
+ui/dist-electron/
+ui/release/
+
+# Локальные данные и артефакты
+artifacts/
+*.log
+*.db
+*.db-wal
+*.db-shm
+.env
+settings.local.json
+
+# Лицензионные ключи (приватный ключ не должен попадать в репозиторий)
+backend/license_keys/
+backend/app/core/license_pubkey.txt
+
+# Сборка
+build/
+dist/
+*.exe
+
+# Выгрузки чужих страниц для офлайн-тестов (получаются tools/capture_ozon.py)
+backend/tests/fixtures/

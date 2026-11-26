@@ -1,0 +1,133 @@
+{
+  "search_input": [
+    {
+      "css": "input[name='text']"
+    },
+    {
+      "widget": "searchBarDesktop",
+      "css": "input"
+    }
+  ],
+  "search_results": [
+    {
+      "widget": "tileGridDesktop"
+    },
+    {
+      "css": "#content"
+    }
+  ],
+  "product_heading": [
+    {
+      "widget": "webProductHeading"
+    },
+    {
+      "widget": "webDetailSKU"
+    }
+  ],
+  "add_to_cart": [
+    {
+      "widget": "webAddToCart",
+      "css": "button"
+    },
+    {
+      "text": "Добавить в корзину"
+    },
+    {
+      "text": "В корзину"
+    }
+  ],
+  "add_to_favorite": [
+    {
+      "widget": "webAddToFavorite",
+      "css": "button"
+    },
+    {
+      "aria": "Добавить в избранное"
+    }
+  ],
+  "favorite_active": [
+    {
+      "aria": "Удалить из избранного"
+    }
+  ],
+  "add_to_compare": [
+    {
+      "widget": "webAddToCompare",
+      "css": "button"
+    },
+    {
+      "text": "В сравнение"
+    }
+  ],
+  "gallery": [
+    {
+      "widget": "webGallery"
+    },
+    {
+      "widget": "webListPhotos"
+    }
+  ],
+  "description": [
+    {
+      "widget": "webDescription"
+    },
+    {
+      "widget": "webCharacteristics"
+    }
+  ],
+  "reviews": [
+    {
+      "widget": "webListReviews"
+    },
+    {
+      "widget": "webReviewProductScore"
+    }
+  ],
+  "review_like": [
+    {
+      "widget": "webListReviews",
+      "css": "button[aria-label*='Нравится']"
+    },
+    {
+      "widget": "webListReviews",
+      "css": "button[aria-label*='Полезно']"
+    },
+    {
+      "widget": "webListReviews",
+      "css": "button[aria-label*='полезн']"
+    },
+    {
+      "css": "button:has-text('Полезно')"
+    },
+    {
+      "text": "Полезно"
+    }
+  ],
+  "see_also": [
+    {
+      "text": "Рекомендуем также"
+    },
+    {
+      "text": "Смотрите также"
+    },
+    {
+      "text": "Похожие товары"
+    }
+  ],
+  "other_sellers": [
+    {
+      "text": "Предложения других продавцов"
+    },
+    {
+      "text": "Другие продавцы"
+    }
+  ],
+  "cookie_accept": [
+    {
+      "text": "Принять"
+    },
+    {
+      "text": "Хорошо"
+    }
+  ]
+}

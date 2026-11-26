@@ -1,0 +1,13 @@
+{
+  "python.defaultInterpreterPath": "backend/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["backend"],
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "editor.formatOnSave": false,
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.venv": true,
+    "**/dist": true,
+    "**/dist-electron": true
+  }
+}
