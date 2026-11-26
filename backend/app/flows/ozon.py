@@ -75,6 +75,7 @@ async def _collect_cards(
         last_height = max(last_height, height)
         if stable >= 6:
             break
+        await human.jitter(page)
         await page.mouse.wheel(0, random.randint(700, 1100))
         await asyncio.sleep(random.uniform(1.0, 1.6))
         # Периодически доходим до низа: virtualScroll Ozon подгружает пачку

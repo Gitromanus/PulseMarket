@@ -36,8 +36,25 @@ async def pause(lo: float = 0.25, hi: float = 0.9) -> float:
     return delay
 
 
+async def jitter(page: Any, max_dx: float = 60.0, max_dy: float = 40.0) -> None:
+    """Небольшой сдвиг курсора вокруг текущей позиции (для живого превью)."""
+    viewport = _viewport(page)
+    position = _MOUSE.get(id(page))
+    if position is None:
+        position = (
+            random.uniform(viewport["width"] * 0.2, viewport["width"] * 0.8),
+            random.uniform(viewport["height"] * 0.2, viewport["height"] * 0.8),
+        )
+    x = min(max(position[0] + random.uniform(-max_dx, max_dx), 0.0), viewport["width"] - 1)
+    y = min(max(position[1] + random.uniform(-max_dy, max_dy), 0.0), viewport["height"] - 1)
+    await page.mouse.move(x, y, steps=random.randint(2, 6))
+    _MOUSE[id(page)] = (x, y)
+
+
 async def wheel(page: Any, dy: float) -> None:
-    """Прокрутка рваными мелкими шагами: колесо не «прыгает» на пол-экрана."""
+    """Прокрутка рваными мелкими шагами, иногда со сдвигом мыши."""
+    if abs(dy) >= 1 and random.random() < 0.45:
+        await jitter(page, max_dx=45.0, max_dy=28.0)
     if abs(dy) < 1:
         return
     steps = max(5, min(30, int(abs(dy) / 55)))
