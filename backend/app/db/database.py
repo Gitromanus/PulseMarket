@@ -218,6 +218,25 @@ class Database:
             )
             await self.conn.commit()
 
+    async def release_after_captcha(self, task_id: int) -> None:
+        """Капча — проблема IP, а не задания: возвращаем в очередь без штрафа."""
+        async with self._lock:
+            await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = CASE WHEN done_runs >= target_runs THEN 'done'
+                                     ELSE 'pending' END,
+                       attempts = 0,
+                       claim_owner = NULL,
+                       claim_at = NULL,
+                       lease_until = NULL,
+                       updated_at = datetime('now')
+                 WHERE id = :id
+                """,
+                {"id": task_id},
+            )
+            await self.conn.commit()
+
     async def fail_task(self, task_id: int, error: str) -> None:
         """Сбой выполнения: attempts растёт, после 3 сбоев задание уходит в error."""
         async with self._lock:
@@ -439,3 +458,237 @@ class Database:
                 inserted += 1
             await self.conn.commit()
         return inserted
+
+    # ---------- встроенная таблица заданий ----------
+
+    TASK_SELECT = """
+        SELECT t.*,
+               r.result      AS last_result,
+               r.position    AS last_position,
+               r.cart_added  AS last_cart,
+               r.liked       AS last_liked,
+               r.finished_at AS last_finished,
+               r.error_msg   AS last_error_msg,
+               (SELECT COUNT(*) FROM runs WHERE task_id = t.id AND result = 'ok')    AS ok_runs,
+               (SELECT COUNT(*) FROM runs WHERE task_id = t.id AND result = 'error') AS error_runs
+          FROM tasks t
+          LEFT JOIN runs r ON r.id = (SELECT MAX(id) FROM runs WHERE task_id = t.id)
+    """
+
+    async def progress(self) -> dict[str, int]:
+        """Сколько прогонов выполнено по заданиям, которые стоят в очереди.
+
+        Выполненные и стоящие на паузе строки в прогресс не входят: полоса
+        показывает только текущую работу, а не всю историю таблицы.
+        """
+        row = await self.fetchone(
+            "SELECT COALESCE(SUM(done_runs), 0) AS done, "
+            "COALESCE(SUM(target_runs), 0) AS target, COUNT(*) AS tasks "
+            "FROM tasks WHERE status IN ('pending', 'claimed', 'running')"
+        ) or {}
+        done = int(row.get("done") or 0)
+        target = int(row.get("target") or 0)
+        percent = round(done * 100 / target) if target else 0
+        return {
+            "done": done,
+            "target": target,
+            "percent": max(0, min(100, percent)),
+            "tasks": int(row.get("tasks") or 0),
+        }
+
+    async def list_tasks(self, limit: int = 300, offset: int = 0, search: str = "") -> list[dict[str, Any]]:
+        sql = self.TASK_SELECT
+        params: list[Any] = []
+        if search:
+            sql += " WHERE t.query LIKE ? OR t.sku LIKE ?"
+            like = f"%{search}%"
+            params += [like, like]
+        sql += " ORDER BY t.id DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        return await self.fetchall(sql, tuple(params))
+
+    async def get_task(self, task_id: int) -> dict[str, Any] | None:
+        return await self.fetchone(self.TASK_SELECT + " WHERE t.id = ?", (task_id,))
+
+    async def create_task(
+        self,
+        *,
+        query: str,
+        sku: str = "",
+        url: str = "",
+        geo: str = "",
+        target_runs: int = 1,
+        marketplace: str = "ozon",
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                INSERT INTO tasks (marketplace, sku, url, query, geo, target_runs,
+                                   priority, source, sheet_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'ui', NULL)
+                """,
+                (marketplace, sku, url, query, geo, max(1, target_runs), priority),
+            )
+            await self.conn.commit()
+            task_id = int(cur.lastrowid or 0)
+        row = await self.get_task(task_id)
+        if row is None:
+            raise RuntimeError("задание не сохранилось")
+        return row
+
+    async def update_task(self, task_id: int, values: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {
+            "query": str,
+            "sku": str,
+            "url": str,
+            "geo": str,
+            "target_runs": int,
+            "priority": int,
+            "marketplace": str,
+        }
+        fields: list[str] = []
+        params: list[Any] = []
+        for key, caster in allowed.items():
+            if key not in values:
+                continue
+            value = values[key]
+            if value is None:
+                value = ""
+            fields.append(f"{key} = ?")
+            params.append(caster(value))
+        if not fields:
+            return await self.get_task(task_id)
+
+        fields.append("updated_at = datetime('now')")
+        params.append(task_id)
+        async with self._lock:
+            await self.conn.execute(
+                f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", tuple(params)
+            )
+            # После смены target_runs статус мог устареть.
+            await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = CASE
+                         WHEN status = 'paused' THEN 'paused'
+                         WHEN done_runs >= target_runs THEN 'done'
+                         ELSE 'pending'
+                       END
+                 WHERE id = ?
+                """,
+                (task_id,),
+            )
+            await self.conn.commit()
+        return await self.get_task(task_id)
+
+    async def delete_task(self, task_id: int) -> bool:
+        async with self._lock:
+            await self.conn.execute("DELETE FROM runs WHERE task_id = ?", (task_id,))
+            await self.conn.execute("DELETE FROM sheet_state WHERE task_id = ?", (task_id,))
+            cur = await self.conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            await self.conn.commit()
+            return bool(cur.rowcount)
+
+    async def requeue_task(self, task_id: int) -> bool:
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET done_runs = 0, status = 'pending', attempts = 0,
+                       last_error = NULL, claim_owner = NULL, claim_at = NULL,
+                       lease_until = NULL, updated_at = datetime('now')
+                 WHERE id = ?
+                """,
+                (task_id,),
+            )
+            await self.conn.commit()
+            return bool(cur.rowcount)
+
+    async def resume_task(self, task_id: int) -> bool:
+        """Продолжить задание с текущего прогресса (без обнуления done_runs)."""
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = CASE WHEN done_runs >= target_runs THEN 'done'
+                                     ELSE 'pending' END,
+                       attempts = 0,
+                       last_error = NULL,
+                       claim_owner = NULL, claim_at = NULL, lease_until = NULL,
+                       updated_at = datetime('now')
+                 WHERE id = ?
+                """,
+                (task_id,),
+            )
+            await self.conn.commit()
+            return bool(cur.rowcount)
+
+    async def set_task_paused(self, task_id: int, paused: bool) -> bool:
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = CASE WHEN ? THEN 'paused'
+                                     WHEN done_runs >= target_runs THEN 'done'
+                                     ELSE 'pending' END,
+                       claim_owner = NULL, claim_at = NULL, lease_until = NULL,
+                       updated_at = datetime('now')
+                 WHERE id = ?
+                """,
+                (1 if paused else 0, task_id),
+            )
+            await self.conn.commit()
+            return bool(cur.rowcount)
+
+    async def task_runs(self, task_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        rows = await self.fetchall(
+            "SELECT id, thread_id, result, position, cart_added, liked, error_code,"
+            " error_msg, started_at, finished_at FROM runs"
+            " WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            (task_id, limit),
+        )
+        for row in rows:
+            row.pop("steps_json", None)
+        return rows
+
+    async def pause_pending(self) -> int:
+        """Убирает из очереди всё, что ещё не взято в работу (задания на паузе)."""
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'paused', claim_owner = NULL, claim_at = NULL,
+                       lease_until = NULL, updated_at = datetime('now')
+                 WHERE status = 'pending'
+                """
+            )
+            await self.conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def resume_all_paused(self) -> int:
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET status = CASE WHEN done_runs >= target_runs THEN 'done'
+                                     ELSE 'pending' END,
+                       attempts = 0, updated_at = datetime('now')
+                 WHERE status IN ('paused', 'error')
+                """
+            )
+            await self.conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def requeue_all_finished(self) -> int:
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE tasks
+                   SET done_runs = 0, status = 'pending', attempts = 0,
+                       last_error = NULL, updated_at = datetime('now')
+                 WHERE status IN ('done', 'error')
+                """
+            )
+            await self.conn.commit()
+            return int(cur.rowcount or 0)

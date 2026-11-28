@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from ..core.config import load_settings
-from ..sheets.sync import build_backend
-
 router = APIRouter(prefix="/api", tags=["system"])
 
 
@@ -45,37 +42,17 @@ async def runs(request: Request, limit: int = 100) -> dict:
     return {"items": rows}
 
 
-@router.post("/dev/seed")
-async def seed(request: Request, count: int = 6) -> dict:
-    count = max(1, min(count, 50))
-    inserted = await request.app.state.db.seed_demo(count)
-    await request.app.state.bus.log(
-        None, f"Демо-данные: добавлено заданий {inserted}" if inserted else "Демо-данные уже загружены"
-    )
-    return {"ok": True, "inserted": inserted}
-
-
 @router.post("/dev/reset")
 async def reset_demo(request: Request) -> dict:
-    """Сброс тестовых данных: только для фейковой таблицы, только на остановленном прогоне."""
+    """Полный сброс встроенной таблицы: задания, история прогонов."""
     sup = request.app.state.sup
     if sup.state != "idle":
         return {"ok": False, "error": "Сначала остановите прогон"}
-
-    backend = build_backend(load_settings())
-    if backend.kind != "fake":
-        return {"ok": False, "error": "Сброс доступен только для тестовой таблицы"}
-
-    path = getattr(backend, "path", None)
-    if path is not None:
-        from pathlib import Path
-
-        Path(path).unlink(missing_ok=True)
 
     db = request.app.state.db
     for table in ("sheet_state", "runs", "tasks"):
         await db.execute(f"DELETE FROM {table}")
 
-    await request.app.state.bus.log(None, "Тестовые данные сброшены, таблица пересоздана")
+    await request.app.state.bus.log(None, "Таблица заданий очищена")
     await request.app.state.sync.cycle()
     return {"ok": True}

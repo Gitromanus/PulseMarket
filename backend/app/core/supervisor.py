@@ -24,16 +24,51 @@ from ..db.database import Database
 from ..flows.base import ScenarioError
 from ..flows.check import run_check
 from ..flows.ozon import run_ozon
+from ..integrations.ltespace import (
+    LtespaceError,
+    auto_rotation_snapshot,
+    proxy_exit_ips,
+    rotate_all,
+    rotate_for_proxy,
+    sync_proxies,
+)
 
 # Ошибки сети/прокси на первой навигации: задание не валим, а один раз
 # повторяем с другим прокси после короткой паузы.
 PROXY_RETRY_MARKERS = ("net::err_failed", "net::err_http_response_code_failure")
 PROXY_RETRY_PAUSE = (10.0, 20.0)
+# 407 приходит, когда Chrome не приложил логин/пароль прокси (гонка на первом
+# запросе после старта или устаревшие доступы LTESpace).
+PROXY_AUTH_MARKERS = ("407", "err_proxy_auth", "err_invalid_auth_credentials")
 
 
 def _is_proxy_network_error(text: str) -> bool:
     low = text.lower()
     return any(marker in low for marker in PROXY_RETRY_MARKERS)
+
+
+def _is_proxy_auth_error(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in PROXY_AUTH_MARKERS)
+
+
+async def _proxy_exit_ip(session: Any) -> str | None:
+    """Внешний IP сессии: запрос идёт через тот же прокси, что и браузер.
+
+    ``context.request`` использует прокси контекста, поэтому это реальный
+    адрес, с которого Ozon видит поток, — по нему и видна ротация.
+    """
+    try:
+        response = await session.context.request.get(
+            "https://api.ipify.org?format=json", timeout=10000
+        )
+        if not response.ok:
+            return None
+        data = await response.json()
+    except Exception:  # noqa: BLE001 — определение IP не должно ломать сценарий
+        return None
+    ip = data.get("ip") if isinstance(data, dict) else None
+    return str(ip) if ip else None
 
 
 def _short_error(exc: Exception) -> str:
@@ -67,6 +102,8 @@ class Supervisor:
         self._watchdog: asyncio.Task | None = None
         self._error_streak = 0
         self._block_streak = 0
+        self._captcha_restarts = 0
+        self._captcha_restarting = False
         self._profiles: ProfileStore | None = None
         self._proxies: ProxyPool | None = None
         self._assignments = ProxyAssignments()
@@ -93,8 +130,13 @@ class Supervisor:
 
     async def metrics(self) -> dict[str, Any]:
         counts = await self.db.counts()
+        progress = await self.db.progress()
         counts.update(
             {
+                "runs_done": progress["done"],
+                "runs_target": progress["target"],
+                "progress_percent": progress["percent"],
+                "progress_tasks": progress["tasks"],
                 "threads_active": sum(
                     1 for t in self.threads.values() if t["status"] == "running"
                 ),
@@ -107,7 +149,12 @@ class Supervisor:
 
     # ---------- управление ----------
 
-    async def start(self, threads_override: int | None = None) -> dict[str, Any]:
+    async def start(
+        self,
+        threads_override: int | None = None,
+        reset_captcha: bool = True,
+        allowed_ports: set[int] | None = None,
+    ) -> dict[str, Any]:
         if self.state == "running":
             return {"ok": False, "error": "Прогон уже запущен"}
 
@@ -141,10 +188,54 @@ class Supervisor:
         self.stats = {"ok": 0, "errors": 0}
         self._error_streak = 0
         self._block_streak = 0
+        if reset_captcha:
+            # Ручной запуск даёт свежий лимит автоперезапусков по капче,
+            # а внутренний перезапуск — нет (иначе цикл бесконечный).
+            self._captcha_restarts = 0
         self._stop.clear()
         self.sessions.clear()
 
         if settings.browser.enabled:
+            # Свежие прокси LTESpace подтягиваем до создания пула: иначе поток
+            # возьмёт устаревший список из файла (истёкшие/заменённые каналы).
+            if settings.ltespace.enabled and settings.ltespace.sync_proxies:
+                try:
+                    result = await asyncio.to_thread(sync_proxies, settings)
+                    await self.bus.log(
+                        None,
+                        f"LTESpace: прокси обновлены — {result['written']} в пуле, "
+                        f"пропущено {result['skipped']}",
+                    )
+                    if result.get("settings_changed"):
+                        settings = load_settings()
+                except LtespaceError as exc:
+                    await self.bus.log(
+                        None, f"LTESpace: прокси не обновлены — {exc}", "warn"
+                    )
+            # Каждый прогон — новый IP: на приватных каналах дёргаем ссылку
+            # ротации до открытия браузеров.
+            if (
+                settings.ltespace.enabled
+                and settings.ltespace.rotate_before_run
+                and settings.ltespace.api_key
+            ):
+                try:
+                    rotated = await asyncio.to_thread(rotate_all, settings)
+                    ips = ", ".join(
+                        f"{port}: {ip}"
+                        for port, ip in rotated.get("new_ips", {}).items()
+                    )
+                    await self.bus.log(
+                        None,
+                        f"LTESpace: IP сменён перед прогоном — "
+                        f"{len(rotated['rotated'])} шт., без ручной ротации "
+                        f"{len(rotated['skipped'])}"
+                        + (f" · {ips}" if ips else ""),
+                    )
+                except LtespaceError as exc:
+                    await self.bus.log(
+                        None, f"LTESpace: смена IP перед прогоном не удалась — {exc}", "warn"
+                    )
             # Пулы переживают остановку прогона: круговой обход продолжается
             # со следующего профиля/прокси, а не начинается заново.
             if self._profiles is None:
@@ -154,7 +245,35 @@ class Supervisor:
             proxies_path = settings.general.proxies_file or None
             if self._proxies is None or self._proxies.path != proxies_path:
                 self._proxies = ProxyPool(proxies_path)
+            else:
+                # Файл мог обновиться (LTESpace), а прошлый прогон мог быть
+                # ограничен только свежими IP — начинаем с полного пула.
+                self._proxies.reload()
             self._proxies.max_per_proxy = max(1, int(settings.general.proxy_max_threads))
+            if allowed_ports is not None:
+                kept = self._proxies.keep_ports(allowed_ports)
+                if kept:
+                    await self.bus.log(
+                        None,
+                        f"Прокси: продолжаем только на свежих IP — {kept} шт. "
+                        f"(порты {', '.join(map(str, sorted(allowed_ports)))})",
+                    )
+                    capacity = kept * max(1, int(settings.general.proxy_max_threads))
+                    if threads > capacity:
+                        await self.bus.log(
+                            None,
+                            f"Потоков {threads} → {capacity}: свежих прокси {kept}",
+                        )
+                        threads = max(1, capacity)
+                else:
+                    # Свежих портов в файле не осталось — не рискуем пустым
+                    # пулом, работаем как обычно.
+                    self._proxies.reload()
+                    await self.bus.log(
+                        None,
+                        "Прокси: свежих IP в пуле не осталось — работаем со всем пулом",
+                        "warn",
+                    )
             self._proxies.clear_leases()
             self._provider = build_provider(settings.browser)
             profile_state = self._profiles.state()
@@ -232,7 +351,7 @@ class Supervisor:
         self._watchdog = asyncio.create_task(self._watchdog_loop(), name="watchdog")
         return {"ok": True, "threads": threads, "pending": pending}
 
-    async def stop(self) -> dict[str, Any]:
+    async def stop(self, reason: str = "остановлено оператором") -> dict[str, Any]:
         if self.state != "running":
             return {"ok": False, "error": "Прогон не запущен"}
         self.state = "stopping"
@@ -257,7 +376,7 @@ class Supervisor:
                     pass
         self.sessions.clear()
 
-        await self._finish_run("остановлено оператором")
+        await self._finish_run(reason)
         return {"ok": True}
 
     async def restart(self, threads_override: int | None = None) -> dict[str, Any]:
@@ -265,6 +384,205 @@ class Supervisor:
             await self.stop()
             await asyncio.sleep(0.3)
         return await self.start(threads_override)
+
+    async def _wait_for_auto_rotation(self, settings: AppSettings) -> set[int]:
+        """Ждёт, пока shared-прокси сам сменит IP по таймеру.
+
+        Возвращает порты прокси с новым IP — как только сменился хотя бы
+        один канал, прогон можно продолжать на нём, не дожидаясь остальных.
+        Пустое множество — IP не сменился (или ожидание отменили).
+        """
+        try:
+            snapshot = await asyncio.to_thread(auto_rotation_snapshot, settings)
+            baseline = await asyncio.to_thread(proxy_exit_ips, settings)
+        except Exception as exc:  # noqa: BLE001 — ожидание не должно ронять ядро
+            await self.bus.log(
+                None,
+                f"Капча: не удалось узнать IP прокси — {type(exc).__name__}: {exc}",
+                "warn",
+            )
+            return set()
+        if not baseline:
+            # Прокси мобильные, первый запрос иногда не проходит с первого раза.
+            for _ in range(2):
+                await asyncio.sleep(5)
+                try:
+                    baseline = await asyncio.to_thread(proxy_exit_ips, settings)
+                except Exception:  # noqa: BLE001
+                    baseline = {}
+                if baseline:
+                    break
+        if not baseline:
+            await self.bus.log(
+                None,
+                "Капча: не удалось получить реальный IP через прокси — прогон остановлен",
+                "error",
+            )
+            return set()
+
+        interval = max((int(info["rotation"]) for info in snapshot.values()), default=5)
+        # Чуть больше интервала ротации на случай задержки у провайдера,
+        # но не дольше 20 минут, чтобы не висеть бесконечно.
+        limit_sec = max(300, min(interval * 60 + 150, 1200))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit_sec
+        current_note = ", ".join(f"порт {port}: {ip}" for port, ip in baseline.items())
+        await self.bus.log(
+            None,
+            f"Капча: ручной ротации нет (shared). Текущие IP — {current_note}. "
+            f"Ждём автосмену раз в {interval} мин, проверяем реальный IP каждые 20 с — "
+            f"как только сменится хотя бы один канал, продолжим на нём "
+            f"(максимум {round(limit_sec / 60)} мин)",
+            "warn",
+        )
+        next_note = loop.time() + 120
+        while True:
+            await asyncio.sleep(20)
+            if self.state == "running":
+                await self.bus.log(
+                    None,
+                    "Капча: прогон запущен вручную — ожидание смены IP отменено",
+                )
+                return set()
+            now = loop.time()
+            if now >= deadline:
+                await self.bus.log(
+                    None,
+                    f"Капча: IP не сменился за {round(limit_sec / 60)} мин — "
+                    "прогон остановлен",
+                    "error",
+                )
+                return set()
+            try:
+                current = await asyncio.to_thread(proxy_exit_ips, settings)
+            except Exception:  # noqa: BLE001 — одна неудачная проверка не критична
+                current = {}
+            changed = {
+                port
+                for port, old_ip in baseline.items()
+                if (new_ip := current.get(port)) and new_ip != old_ip
+            }
+            if changed:
+                for port in sorted(changed):
+                    await self.bus.log(
+                        None,
+                        f"Капча: IP прокси {port} сменился "
+                        f"{baseline[port]} → {current[port]}",
+                        "success",
+                    )
+                if len(changed) < len(baseline):
+                    await self.bus.log(
+                        None,
+                        f"Капча: свежих прокси {len(changed)} из {len(baseline)} — "
+                        "продолжаем на них, остальные каналы в этом прогоне не используем",
+                    )
+                return changed
+            if now >= next_note:
+                left = max(1, round((deadline - now) / 60))
+                await self.bus.log(
+                    None, f"Капча: IP ещё не сменился, ждём… (осталось ~{left} мин)"
+                )
+                next_note = now + 120
+
+    async def _restart_after_captcha(self, settings: AppSettings) -> None:
+        """Капча Ozon: глушим прогон, меняем IP и стартуем заново.
+
+        Ограничение повторов защищает от бесконечного цикла, если капча
+        висит на всех каналах: после ``captcha_restart_limit`` автоперезапуск
+        выключается, прогон остаётся остановленным.
+        """
+        if self._captcha_restarting:
+            return
+        self._captcha_restarting = True
+        try:
+            self._captcha_restarts += 1
+            limit = settings.ltespace.captcha_restart_limit
+            if limit and self._captcha_restarts > limit:
+                await self.bus.log(
+                    None,
+                    f"Капча повторилась {limit} раз — автоперезапуск остановлен, "
+                    "проверьте прокси вручную",
+                    "error",
+                )
+                if self.state == "running":
+                    await self.stop(reason="капча Ozon — лимит автоперезапусков")
+                return
+
+            if self.state == "running":
+                await self.stop(reason="капча Ozon — ждём смены IP")
+                # Даём закрыться браузерам и watchdog, прежде чем стартовать.
+                await asyncio.sleep(0.5)
+
+            rotated: dict[str, Any] = {"rotated": [], "skipped": [], "errors": {}, "new_ips": {}}
+            allowed_ports: set[int] | None = None
+            try:
+                rotated = await asyncio.to_thread(rotate_all, settings)
+                await self.bus.log(
+                    None,
+                    f"Капча: IP сменён у {len(rotated['rotated'])} прокси"
+                    + (
+                        f", без ручной ротации {len(rotated['skipped'])}"
+                        if rotated["skipped"]
+                        else ""
+                    )
+                    + (
+                        f", ошибок {len(rotated['errors'])}"
+                        if rotated["errors"]
+                        else ""
+                    )
+                    + (
+                        " · "
+                        + ", ".join(
+                            f"{port}: {ip}"
+                            for port, ip in rotated.get("new_ips", {}).items()
+                        )
+                        if rotated.get("new_ips")
+                        else ""
+                    ),
+                    "warn",
+                )
+            except LtespaceError as exc:
+                await self.bus.log(
+                    None, f"Капча: сменить IP не удалось — {exc}", "warn"
+                )
+            except Exception as exc:  # noqa: BLE001 — ротация не должна ломать перезапуск
+                await self.bus.log(
+                    None, f"Капча: ошибка смены IP — {type(exc).__name__}: {exc}", "warn"
+                )
+
+            if settings.ltespace.enabled and not rotated["rotated"] and rotated["skipped"]:
+                # Shared-тариф: ручной ротации нет, но IP меняется по таймеру.
+                # Не останавливаем прогон навсегда — ждём смены IP и стартуем.
+                changed = await self._wait_for_auto_rotation(settings)
+                if not changed:
+                    return
+                allowed_ports = changed
+
+            delay = settings.ltespace.captcha_restart_delay_sec
+            if delay:
+                await self.bus.log(None, f"Перезапуск прогона через {delay} с")
+                await asyncio.sleep(delay)
+
+            if self.state != "running" and await self.db.count_unfinished() > 0:
+                result = await self.start(reset_captcha=False, allowed_ports=allowed_ports)
+                if not result.get("ok"):
+                    await self.bus.log(
+                        None,
+                        f"Капча: перезапуск не удался — {result.get('error')}",
+                        "error",
+                    )
+            else:
+                await self.bus.log(None, "Перезапуск не нужен: очередь пуста")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — цикл прогона не должен падать
+            await self.bus.log(
+                None,
+                f"Автоперезапуск после капчи не удался: {type(exc).__name__}: {exc}",
+                "error",
+            )
+        finally:
+            self._captcha_restarting = False
 
     def busy_profile_paths(self) -> set[str]:
         """Папки профилей, занятые потоками: ручной режим не должен их открывать."""
@@ -316,7 +634,8 @@ class Supervisor:
                 if not waiting_logged:
                     await self.bus.log(
                         thread_id,
-                        "Свободных строк нет — жду, пока другой поток освободит задание",
+                        "Свободных строк нет — поток простаивает, пока другой поток "
+                        "не вернёт строку в очередь (это не блокировка)",
                         "warn",
                     )
                     waiting_logged = True
@@ -346,8 +665,10 @@ class Supervisor:
                     "task_id": task["id"],
                     "status": "running",
                     "sku": task["sku"],
+                    "query": task["query"],
                     "profile": None,
                     "proxy": None,
+                    "proxy_ip": None,
                     "hwnd": None,
                 }
             )
@@ -371,6 +692,7 @@ class Supervisor:
                 self.stats["ok"] += 1
                 self._error_streak = 0
                 self._block_streak = 0
+                self._captcha_restarts = 0
 
                 await self.db.record_run(
                     task_id=task["id"],
@@ -431,8 +753,62 @@ class Supervisor:
                     started_at=started,
                 )
                 await self.bus.log(thread_id, f"Ошибка: {exc}", "error")
+                if (
+                    "ozon_captcha" in text
+                    and settings.ltespace.enabled
+                    and settings.ltespace.restart_on_captcha
+                ):
+                    # Капча — не ошибка задания: после смены IP его нужно
+                    # повторить, иначе очередь «пустеет» и прогон встаёт.
+                    await self.db.release_after_captcha(task["id"])
+                    await self.bus.log(
+                        thread_id,
+                        "Ozon показал капчу: закрываем браузеры, меняем IP и "
+                        "запускаем прогон заново",
+                        "warn",
+                    )
+                    asyncio.create_task(
+                        self._restart_after_captcha(settings), name="captcha-restart"
+                    )
+                    return
                 if "ozon_blocked" in text or "антибот" in text:
                     self._block_streak += 1
+                    if settings.ltespace.enabled and settings.ltespace.rotate_on_block:
+                        session = self.sessions.get(thread_id)
+                        proxy = getattr(session, "proxy", None)
+                        try:
+                            rotated = await asyncio.to_thread(
+                                rotate_for_proxy, settings, proxy
+                            )
+                        except LtespaceError as exc:
+                            rotated = {"ok": False, "error": str(exc)}
+                        if rotated.get("ok"):
+                            ip_note = ""
+                            if rotated.get("new_ip"):
+                                ip_note = (
+                                    f": {rotated.get('old_ip') or '?'} → "
+                                    f"{rotated['new_ip']}"
+                                )
+                            await self.bus.log(
+                                thread_id,
+                                f"LTESpace: IP сменён (порт {rotated.get('port')}){ip_note}",
+                            )
+                            session = self.sessions.get(thread_id)
+                            live_ip = (
+                                await _proxy_exit_ip(session) if session else None
+                            )
+                            if live_ip:
+                                state["proxy_ip"] = live_ip
+                                await self._publish_thread(thread_id)
+                                await self.bus.log(
+                                    thread_id, f"Текущий внешний IP: {live_ip}"
+                                )
+                        else:
+                            await self.bus.log(
+                                thread_id,
+                                f"LTESpace: IP не сменён — {rotated.get('error')}",
+                                "warn",
+                            )
                     if self._block_streak >= 2:
                         await self.bus.log(
                             None,
@@ -471,8 +847,13 @@ class Supervisor:
                     settings.general.task_gap_max_sec,
                 )
                 if gap > 0:
+                    state["status"] = "pause"
+                    await self._publish_thread(thread_id)
                     await self.bus.log(thread_id, f"Пауза между карточками {gap:.0f} с")
                     await asyncio.sleep(gap)
+                    if not self._stop.is_set():
+                        state["status"] = "running"
+                        await self._publish_thread(thread_id)
 
         state["status"] = "idle"
         await self._publish_thread(thread_id)
@@ -490,12 +871,27 @@ class Supervisor:
 
         profile = None
         allow_ephemeral = settings.view.profile_use_pct < 100
-        for attempt in range(30):
-            profile, _ = self._profiles.acquire(
+        for attempt in range(60):
+            candidate, _ = self._profiles.acquire(
                 settings.view.profile_use_pct, allow_ephemeral=allow_ephemeral
             )
-            if profile is not None:
-                break
+            if candidate is not None:
+                # Профиль жёстко привязан к прокси. Если этот прокси уже занят
+                # другим потоком, берём следующий профиль: иначе потоки встают
+                # в очередь друг за другом, хотя свободные каналы есть.
+                assigned = self._assignments.proxy_for(candidate.id, self._proxies)
+                if self._proxies.has_capacity(assigned):
+                    profile = candidate
+                    break
+                self._profiles.release(candidate)
+                if attempt == 0:
+                    await self.bus.log(
+                        thread_id,
+                        "Ждём профиль, чей прокси не занят другим потоком",
+                        "warn",
+                    )
+                await asyncio.sleep(0.5)
+                continue
             if attempt == 0:
                 await self.bus.log(
                     thread_id,
@@ -504,17 +900,46 @@ class Supervisor:
                 )
             await asyncio.sleep(1)
         if profile is None:
-            raise RuntimeError("нет свободного прогретого профиля: уменьшите число потоков")
+            raise RuntimeError(
+                "нет свободного профиля: все привязанные прокси заняты — "
+                "добавьте прокси или уменьшите число потоков"
+            )
 
         try:
-            for attempt in (1, 2):
+            for attempt in (1, 2, 3):
                 try:
                     return await self._run_browser_once(
                         thread_id, task, settings, steps, state, profile
                     )
                 except Exception as exc:  # noqa: BLE001
-                    if attempt >= 2 or not _is_proxy_network_error(str(exc)):
+                    text = str(exc)
+                    if attempt >= 3 or not _is_proxy_network_error(text):
                         raise
+                    # 407 — прокси не получил логин/пароль. Чаще всего это гонка
+                    # на первом запросе: повтор тем же адресом проходит.
+                    if _is_proxy_auth_error(text) and attempt == 1:
+                        await self.bus.log(
+                            thread_id,
+                            "Прокси вернул 407 (авторизация): повторяем тем же прокси",
+                            "warn",
+                        )
+                        await asyncio.sleep(random.uniform(2.0, 4.0))
+                        continue
+                    if _is_proxy_auth_error(text) and settings.ltespace.enabled:
+                        await self.bus.log(
+                            thread_id,
+                            "Прокси вернул 407: обновляю доступы LTESpace",
+                            "warn",
+                        )
+                        try:
+                            await asyncio.to_thread(sync_proxies, settings)
+                            self._proxies.reload()
+                        except LtespaceError as refresh_exc:
+                            await self.bus.log(
+                                thread_id,
+                                f"LTESpace: доступы не обновлены — {refresh_exc}",
+                                "warn",
+                            )
                     # Профиль остаётся тем же, меняем только закреплённый прокси.
                     failed_raw = self._assignments.get(profile.id)
                     new_proxy = self._assignments.reassign(
@@ -534,7 +959,8 @@ class Supervisor:
                     await asyncio.sleep(pause)
         finally:
             self._profiles.release(profile)
-            state.update({"profile": None, "proxy": None, "hwnd": None, "browser_visible": False})
+            state.update({"profile": None, "proxy": None,
+                    "proxy_ip": None, "hwnd": None, "browser_visible": False})
             await self._publish_thread(thread_id)
 
     async def _run_browser_once(
@@ -579,6 +1005,7 @@ class Supervisor:
                 "profile": profile.label,
                 "profile_kind": profile.kind,
                 "proxy": proxy.masked() if proxy else "direct",
+                "proxy_ip": None,
             }
         )
         await self._publish_thread(thread_id)
@@ -595,11 +1022,24 @@ class Supervisor:
             state.update({"hwnd": session.hwnd, "browser_visible": session.visible})
             if session.hwnd and not settings.browser.headless:
                 # По умолчанию окно скрыто: оператор видит живое превью и
-                # открывает браузер кликом, когда нужно.
+                # открывает браузер кликом, когда нужно. Прячем сразу после
+                # запуска — до любых сетевых проверок, иначе окно «вылазит».
                 show = bool(settings.browser.show_on_start)
                 win_window.set_visible(session.hwnd, show)
+                if not show:
+                    # Chrome иногда показывает окно после первого кадра —
+                    # прячем повторно, чтобы не «вылазило» перед оператором.
+                    await asyncio.sleep(0.3)
+                    win_window.set_visible(session.hwnd, False)
                 session.visible = show and win_window.is_visible(session.hwnd)
                 state["browser_visible"] = session.visible
+            await self._publish_thread(thread_id)
+
+            exit_ip = await _proxy_exit_ip(session) if proxy is not None else None
+            if exit_ip:
+                state["proxy_ip"] = exit_ip
+                await self._publish_thread(thread_id)
+                await self.bus.log(thread_id, f"Внешний IP прокси: {exit_ip}")
             await self._publish_thread(thread_id)
             await self.bus.log(
                 thread_id,
@@ -650,7 +1090,8 @@ class Supervisor:
             self.sessions.pop(thread_id, None)
             if proxy is not None:
                 self._proxies.release(proxy)
-            state.update({"profile": None, "proxy": None, "hwnd": None, "browser_visible": False})
+            state.update({"profile": None, "proxy": None,
+                    "proxy_ip": None, "hwnd": None, "browser_visible": False})
             await self._publish_thread(thread_id)
 
     async def _scenario(
@@ -713,3 +1154,4 @@ class Supervisor:
         )
         await self.bus.log(None, f"Прогон завершён: {reason}. Успешно {self.stats['ok']}, ошибок {self.stats['errors']}")
         self.threads.clear()
+

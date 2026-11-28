@@ -71,12 +71,17 @@ export function SchedulerPanel({ api, onNotice }: { api: ApiClient; onNotice: (t
 
   return (
     <div className="stack">
-      <div className="field">
-        <span className="field-label">Запускать прогон автоматически</span>
-        <select value={enabled ? "yes" : "no"} onChange={(event) => setEnabled(event.target.value === "yes")}>
-          <option value="no">Нет</option>
-          <option value="yes">Да</option>
-        </select>
+      <div className="toggle-row">
+        <span>Запускать прогон автоматически</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          className={enabled ? "switch on" : "switch"}
+          onClick={() => setEnabled(!enabled)}
+        >
+          <i />
+        </button>
       </div>
       <div className="field">
         <span className="field-label">Интервал, минут</span>

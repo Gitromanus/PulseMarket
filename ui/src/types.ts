@@ -11,9 +11,11 @@ export type ThreadState = {
   task_id: number | null;
   browser_visible: boolean;
   sku?: string;
+  query?: string | null;
   profile?: string | null;
   profile_kind?: string | null;
   proxy?: string | null;
+  proxy_ip?: string | null;
   hwnd?: number | null;
 };
 
@@ -26,6 +28,10 @@ export type Stats = {
   threads_active: number;
   run_state: string;
   ok: number;
+  runs_done?: number;
+  runs_target?: number;
+  progress_percent?: number;
+  progress_tasks?: number;
 };
 
 export type RunRow = {
@@ -54,13 +60,7 @@ export type QuickActions = {
 export type Settings = {
   general: {
     fingerprint_key: string;
-    google_credentials: string;
-    spreadsheet_id: string;
-    sheet_tasks: string;
-    sheet_accounts: string;
-    sheet_orders: string;
     proxies_file: string;
-    sheet_xlsx: string;
     dir_active: string;
     dir_done: string;
     dir_noauth: string;
@@ -98,6 +98,44 @@ export type Settings = {
     check_url: string;
   };
   license: { key: string; server: string };
+  ltespace: {
+    api_key: string;
+    enabled: boolean;
+    proxies_file: string;
+    sync_proxies: boolean;
+    rotate_on_block: boolean;
+    rotate_before_run: boolean;
+    restart_on_captcha: boolean;
+    captcha_restart_delay_sec: number;
+    captcha_restart_limit: number;
+    protocol: "http" | "socks" | "auto";
+  };
+};
+
+export type LtespaceProxy = {
+  id: number | null;
+  port: number;
+  host: string;
+  ip?: string | null;
+  masked: string;
+  tariff: string | null;
+  operator: string | null;
+  city: string | null;
+  country: string | null;
+  rotation: number | null;
+  expire: string | null;
+  active: boolean;
+  manual_rotation_available: boolean;
+};
+
+export type LtespaceStatus = {
+  ok: boolean;
+  enabled: boolean;
+  balance: number | null;
+  currency: string | null;
+  proxies: LtespaceProxy[];
+  file: string;
+  error: string | null;
 };
 
 export type LicenseStatus = {

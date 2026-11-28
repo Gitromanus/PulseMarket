@@ -11,12 +11,14 @@ from fastapi.responses import JSONResponse
 
 from .api import browser as browser_api
 from .api import license as license_api
+from .api import ltespace as ltespace_api
 from .api import manual as manual_api
 from .api import report as report_api
 from .api import run as run_api
 from .api import settings as settings_api
 from .api import sheets as sheets_api
 from .api import system as system_api
+from .api import tasks as tasks_api
 from .api import threads as threads_api
 from .browser.providers import shutdown_playwright
 from .core.config import write_runtime
@@ -107,10 +109,12 @@ def create_app(port: int | None = None) -> FastAPI:
     app.include_router(run_api.router)
     app.include_router(threads_api.router)
     app.include_router(system_api.router)
+    app.include_router(tasks_api.router)
     app.include_router(sheets_api.router)
     app.include_router(browser_api.router)
     app.include_router(manual_api.router)
     app.include_router(license_api.router)
+    app.include_router(ltespace_api.router)
     app.include_router(report_api.router)
     app.include_router(ws_router)
     return app

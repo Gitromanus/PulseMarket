@@ -38,32 +38,14 @@ async def restart(request: Request, payload: StartRequest | None = None) -> dict
 
 @router.post("/requeue")
 async def requeue(request: Request) -> dict:
-    """Возвращает выполненные задания текущего листа в очередь (повторный прогон)."""
+    """Возвращает выполненные и ошибочные задания в очередь (повторный прогон)."""
     if request.app.state.sup.state != "idle":
         return {"ok": False, "error": "Сначала остановите прогон"}
 
     db = request.app.state.db
-    row = await db.fetchone("SELECT value FROM settings WHERE key = 'sync_source'")
-    source = row["value"] if row else None
-    if not source:
-        return {"ok": False, "error": "Источник таблицы не определён: сначала синхронизируйте лист"}
-
-    tasks = await db.fetchall(
-        "SELECT id FROM tasks WHERE source = ? AND status IN ('done', 'error')", (source,)
-    )
-    if not tasks:
+    count = await db.requeue_all_finished()
+    if not count:
         return {"ok": False, "error": "Нет выполненных заданий для повтора"}
 
-    await db.execute(
-        "UPDATE tasks SET done_runs = 0, status = 'pending', last_error = NULL,"
-        " updated_at = datetime('now')"
-        " WHERE source = ? AND status IN ('done', 'error')",
-        (source,),
-    )
-    for task in tasks:
-        await db.execute("DELETE FROM sheet_state WHERE task_id = ?", (task["id"],))
-
-    await request.app.state.bus.log(
-        None, f"Возвращено в очередь выполненных заданий: {len(tasks)}"
-    )
-    return {"ok": True, "requeued": len(tasks)}
+    await request.app.state.bus.log(None, f"Возвращено в очередь заданий: {count}")
+    return {"ok": True, "requeued": count}

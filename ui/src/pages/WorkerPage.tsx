@@ -1,33 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import type { ApiClient } from "../api";
-import type { LogEvent, RunRow, Stats, SyncState, ThreadState } from "../types";
+import type { LogEvent, RunRow, Stats, ThreadState } from "../types";
 import { Modal, ReportPanel, SchedulerPanel } from "../components/Dialogs";
 
 type Props = {
   api: ApiClient;
   stats: Stats | null;
-  sync: SyncState | null;
   threads: ThreadState[];
   logs: LogEvent[];
   runs: RunRow[];
   running: boolean;
   onStart: () => void;
   onStop: () => void;
-  onRestart: () => void;
-  onSeed: () => void;
-  onSync: () => void;
-  onRequeue: () => void;
+  onOpenTasks: () => void;
   onNotice: (text: string) => void;
   onToggleBrowser: (thread: ThreadState) => void;
   onShowBrowser: (thread: ThreadState) => void;
   onClearLogs: () => void;
-};
-
-const STATUS_LABEL: Record<string, string> = {
-  idle: "свободен",
-  waiting: "ждёт задание",
-  running: "работает",
-  done: "готово",
 };
 
 export default function WorkerPage(props: Props) {
@@ -44,25 +33,8 @@ export default function WorkerPage(props: Props) {
         <button className="btn danger" onClick={props.onStop} disabled={!running}>
           ■ Остановить
         </button>
-        <button className="btn" onClick={props.onRestart}>
-          ↻ Перезапуск
-        </button>
-        <button className="btn ghost" onClick={props.onSeed}>
-          + Демо-данные
-        </button>
-        <button className="btn ghost" onClick={props.onSync}>
-          ↔ Синк таблицы
-        </button>
-        <button
-          className="btn ghost"
-          onClick={() => {
-            if (window.confirm("Вернуть выполненные задания в очередь? Счётчики в листе продолжат расти.")) {
-              props.onRequeue();
-            }
-          }}
-          title="Сбросить прогресс выполненных заданий текущего листа и запустить их снова"
-        >
-          ↻ Повторить выполненные
+        <button className="btn ghost" onClick={props.onOpenTasks}>
+          Очередь: {stats?.pending ?? 0}
         </button>
         <div className="spacer" />
         <button id="btn-scheduler" className="btn" onClick={() => setDialog("scheduler")}>
@@ -72,9 +44,10 @@ export default function WorkerPage(props: Props) {
           Отчёт о ресурсах
         </button>
         <div className="toolbar-note">
-          Таблица: {props.sync?.mode ?? "—"} ·{" "}
-          {props.sync?.enabled === false ? "синк выключен" : `push ${props.sync?.last_push ?? "—"}`}
-          {props.sync?.last_error ? " · ошибка синка" : ""}
+          {stats?.runs_target
+            ? `Прогресс: ${stats.runs_done ?? 0} / ${stats.runs_target} прогонов · ` +
+              `${stats.progress_percent ?? 0}%`
+            : "Прогресс: очередь пуста"}
         </div>
       </div>
 
@@ -95,7 +68,10 @@ export default function WorkerPage(props: Props) {
           <span className="muted">{threads.length ? `${threads.length} шт.` : "не запущены"}</span>
         </div>
         {threads.length === 0 ? (
-          <div className="empty">Нажмите «Старт», чтобы поднять потоки. Если очередь пуста — загрузите демо-данные.</div>
+          <div className="empty">
+            Нажмите «Старт», чтобы поднять потоки. Если очередь пуста — добавьте задания
+            на вкладке «Задания».
+          </div>
         ) : (
           <div className="threads">
             {threads.map((thread) => (
@@ -104,34 +80,34 @@ export default function WorkerPage(props: Props) {
                   <span className="thread-title">Поток №{thread.id}</span>
                   <span className={`dot dot-${thread.status}`} />
                 </div>
-                <div className="thread-body">
-                  <div className="thread-row">
-                    <span>Статус</span>
-                    <b>{STATUS_LABEL[thread.status] ?? thread.status}</b>
-                  </div>
-                  <div className="thread-row">
-                    <span>Задание</span>
-                    <b>{thread.task_id ? `#${thread.task_id} · ${thread.sku ?? ""}` : "—"}</b>
-                  </div>
-                  {thread.profile && (
+                <div className="thread-main">
+                  <div className="thread-body">
                     <div className="thread-row">
-                      <span>Профиль</span>
-                      <b title={thread.profile}>{thread.profile}</b>
+                      <span>Запрос</span>
+                      <b title={thread.query ?? thread.sku ?? ""}>
+                        {thread.query || thread.sku || "—"}
+                      </b>
                     </div>
-                  )}
-                  {thread.proxy && (
-                    <div className="thread-row">
-                      <span>Прокси</span>
-                      <b title={thread.proxy}>{thread.proxy}</b>
-                    </div>
-                  )}
+                    {thread.profile && (
+                      <div className="thread-row">
+                        <span>Профиль</span>
+                        <b title={thread.profile}>{thread.profile}</b>
+                      </div>
+                    )}
+                    {thread.proxy_ip && (
+                      <div className="thread-row">
+                        <span>Внешний IP</span>
+                        <b title={thread.proxy_ip}>{thread.proxy_ip}</b>
+                      </div>
+                    )}
+                  </div>
+                  <BrowserPreview
+                    api={props.api}
+                    thread={thread}
+                    onOpen={props.onShowBrowser}
+                    onHide={props.onToggleBrowser}
+                  />
                 </div>
-                <BrowserPreview
-                  api={props.api}
-                  thread={thread}
-                  onOpen={props.onShowBrowser}
-                  onHide={props.onToggleBrowser}
-                />
               </div>
             ))}
           </div>
@@ -162,15 +138,6 @@ export default function WorkerPage(props: Props) {
         <div>
           <div className="subtabs results-toolbar">
             <span className="muted">Результаты прогонов: {runs.length}</span>
-            <button
-              className="btn small ghost"
-              style={{ marginLeft: "auto" }}
-              onClick={props.onClearLogs}
-              disabled={logs.length === 0}
-              title="Очистить историю логов (журнал ядра тоже)"
-            >
-              Очистить логи
-            </button>
           </div>
           <ResultsTable runs={runs} />
         </div>

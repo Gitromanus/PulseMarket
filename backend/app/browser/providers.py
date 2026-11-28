@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
+from pathlib import Path
 from typing import Any, Protocol
 
 import psutil
@@ -142,6 +144,19 @@ def _browser_pids(marker: str) -> list[int]:
     return pids
 
 
+def clear_stale_service_workers(folder: Any) -> None:
+    """Убирает Service Worker из профиля перед запуском браузера.
+
+    Старый SW (например, Ozon) перехватывает переходы и отдаёт закэшированный
+    неуспешный ответ: страница падает с ERR_HTTP_RESPONSE_CODE_FAILURE / 407,
+    хотя прокси рабочий. На чистом профиле та же ссылка открывается нормально.
+    Кэш SW — не часть отпечатка, поэтому чистим его без потери личности.
+    """
+    target = Path(folder) / "Default" / "Service Worker"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+
+
 class VanillaProvider:
     kind = "vanilla"
 
@@ -149,6 +164,7 @@ class VanillaProvider:
         self.settings = settings
 
     async def open(self, profile: Profile, proxy: Proxy | None) -> BrowserSession:
+        clear_stale_service_workers(profile.folder)
         pw = await get_playwright()
         device = device_for(profile.id)
         options: dict[str, Any] = {

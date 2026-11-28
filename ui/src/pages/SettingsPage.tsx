@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import type { ApiClient } from "../api";
-import type { Settings, SyncState } from "../types";
+import type { LtespaceStatus, Settings } from "../types";
 
 type ProfileRow = {
   name: string;
@@ -41,6 +41,7 @@ type ProxyCheckItem = {
   server: string;
   status: "ok" | "blocked" | "challenge" | "error";
   http: number | null;
+  ip?: string | null;
   error: string | null;
   checked_at: string;
 };
@@ -62,14 +63,14 @@ type ProxyCheckStatus = {
 type Props = {
   api: ApiClient;
   settings: Settings;
-  sync: SyncState | null;
   onChange: (next: Settings) => void;
   onNotice: (text: string) => void;
-  onSync: () => void;
 };
 
-export default function SettingsPage({ api, settings, sync, onChange, onNotice, onSync }: Props) {
-  const [section, setSection] = useState<"general" | "view">("general");
+export default function SettingsPage({ api, settings, onChange, onNotice }: Props) {
+  const [section, setSection] = useState<
+    "general" | "proxies" | "profiles" | "browser" | "view"
+  >("general");
   const [busy, setBusy] = useState(false);
   const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
   const [genCount, setGenCount] = useState(20);
@@ -80,6 +81,8 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
   const [proxyList, setProxyList] = useState<ProxyList | null>(null);
   const [proxyLine, setProxyLine] = useState("");
   const [proxyBusy, setProxyBusy] = useState(false);
+  const [ltStatus, setLtStatus] = useState<LtespaceStatus | null>(null);
+  const [ltBusy, setLtBusy] = useState(false);
 
   const loadProfileStats = async () => {
     try {
@@ -201,21 +204,14 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
     onChange({ ...settings, view: { ...settings.view, [key]: value } });
   const setBrowser = <K extends keyof Settings["browser"]>(key: K, value: Settings["browser"][K]) =>
     onChange({ ...settings, browser: { ...settings.browser, [key]: value } });
+  const setLtespace = <K extends keyof Settings["ltespace"]>(
+    key: K,
+    value: Settings["ltespace"][K],
+  ) => onChange({ ...settings, ltespace: { ...settings.ltespace, [key]: value } });
   const setQuick = <K extends keyof Settings["general"]["quick_actions"]>(
     key: K,
     value: Settings["general"]["quick_actions"][K],
   ) => setGeneral("quick_actions", { ...settings.general.quick_actions, [key]: value });
-
-  const pickExcel = async () => {
-    try {
-      const path = await window.pf?.pickExcel?.();
-      if (!path) return;
-      setGeneral("sheet_xlsx", path);
-      onNotice("Excel выбран. Нажмите «Сохранить», чтобы применить.");
-    } catch (error) {
-      onNotice(String(error).replace("Error: ", ""));
-    }
-  };
 
   const startWarmup = async () => {
     const count = Math.max(1, Math.min(500, Number(warmCount) || 0));
@@ -400,6 +396,83 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
     }
   };
 
+  const loadLtespace = async () => {
+    if (!settings.ltespace.api_key.trim()) {
+      onNotice("Сначала сохраните API-ключ LTESpace");
+      return;
+    }
+    setLtBusy(true);
+    try {
+      setLtStatus(await api.get<LtespaceStatus>("/api/ltespace/status"));
+    } catch (error) {
+      onNotice(String(error).replace("Error: ", ""));
+    } finally {
+      setLtBusy(false);
+    }
+  };
+
+  const syncLtespace = async () => {
+    setLtBusy(true);
+    try {
+      const result = await api.post<{
+        ok: boolean;
+        error?: string;
+        written?: number;
+        skipped?: number;
+        pinned?: number;
+        profiles?: number;
+        file?: string;
+      }>("/api/ltespace/sync");
+      if (!result.ok) {
+        onNotice(result.error ?? "Не удалось синхронизировать прокси LTESpace");
+        return;
+      }
+      onNotice(
+        `LTESpace: ${result.written ?? 0} прокси в пуле, пропущено ${result.skipped ?? 0}, ` +
+          `перезакреплено профилей ${result.pinned ?? 0} из ${result.profiles ?? 0}`,
+      );
+      if (result.file && settings.general.proxies_file !== result.file) {
+        onChange({
+          ...settings,
+          general: { ...settings.general, proxies_file: result.file },
+        });
+      }
+      await loadProxies();
+      await loadLtespace();
+    } catch (error) {
+      onNotice(String(error).replace("Error: ", ""));
+    } finally {
+      setLtBusy(false);
+    }
+  };
+
+  const rotateLtespace = async (port: number) => {
+    setLtBusy(true);
+    try {
+      const result = await api.post<{
+        ok: boolean;
+        error?: string;
+        old_ip?: string | null;
+        new_ip?: string | null;
+      }>("/api/ltespace/rotate", {
+        port,
+      });
+      onNotice(
+        result.ok
+          ? `LTESpace: IP порта ${port} сменён` +
+              (result.new_ip
+                ? `: ${result.old_ip ?? "?"} → ${result.new_ip}`
+                : "")
+          : (result.error ?? "Не удалось сменить IP"),
+      );
+      if (result.ok) await loadLtespace();
+    } catch (error) {
+      onNotice(String(error).replace("Error: ", ""));
+    } finally {
+      setLtBusy(false);
+    }
+  };
+
   const save = async () => {
     setBusy(true);
     try {
@@ -407,6 +480,7 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
       const check = await api.post<{ ok: boolean; warnings: string[] }>("/api/settings/validate", settings);
       await loadProfileStats();
       await loadProxies();
+      if (settings.ltespace.api_key.trim()) await loadLtespace();
       onNotice(
         check.warnings.length
           ? `Сохранено, но есть замечания: ${check.warnings.join(" · ")}`
@@ -446,38 +520,6 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
     }
   };
 
-  const resetDemo = async () => {
-    if (!window.confirm("Удалить задания, результаты и пересоздать тестовую таблицу?")) return;
-    try {
-      const result = await api.post<{ ok: boolean; error?: string }>("/api/dev/reset");
-      onNotice(result.ok ? "Тестовые данные сброшены" : (result.error ?? "Не удалось сбросить"));
-    } catch (error) {
-      onNotice(String(error).replace("Error: ", ""));
-    }
-  };
-
-  const testSheets = async () => {
-    try {
-      const result = await api.post<{
-        ok: boolean;
-        error?: string;
-        mode?: string;
-        title?: string;
-        path?: string;
-        sheets?: string[];
-        missing?: string[];
-      }>("/api/sheets/test");
-      if (!result.ok) onNotice(result.error ?? `Нет листов: ${result.missing?.join(", ")}`);
-      else {
-        const label =
-          result.mode === "fake" ? "Тестовая таблица" : result.mode === "excel" ? "Excel" : "Google Sheets";
-        onNotice(`${label}: ${result.title}. Листы: ${result.sheets?.join(", ")}`);
-      }
-    } catch (error) {
-      onNotice(String(error).replace("Error: ", ""));
-    }
-  };
-
   const proxyItems = proxyCheck?.items ?? [];
   const badProxies = proxyItems.filter(
     (item) => item.status === "blocked" || item.status === "error",
@@ -509,60 +551,51 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
         >
           Основные
         </button>
+        <button
+          className={section === "proxies" ? "subtab active" : "subtab"}
+          onClick={() => setSection("proxies")}
+        >
+          Прокси
+        </button>
+        <button
+          className={section === "profiles" ? "subtab active" : "subtab"}
+          onClick={() => setSection("profiles")}
+        >
+          Профили
+        </button>
+        <button
+          className={section === "browser" ? "subtab active" : "subtab"}
+          onClick={() => setSection("browser")}
+        >
+          Браузер
+        </button>
         <button className={section === "view" ? "subtab active" : "subtab"} onClick={() => setSection("view")}>
-          Настройки просмотра
+          Просмотр
         </button>
         <div className="spacer" />
-        <button className="btn ghost" onClick={testSheets} disabled={busy}>
-          Проверить Google Sheets
-        </button>
         <button className="btn primary" onClick={save} disabled={busy}>
           {busy ? "Сохранение…" : "Сохранить"}
         </button>
       </div>
 
-      {section === "general" ? (
+      {section !== "view" ? (
         <div className="grid">
+          {(section === "general" || section === "proxies") && (
           <fieldset className="panel">
-            <legend>Доступы и файлы</legend>
-            <Field label="Ключ FingerPrint">
-              <input
-                value={settings.general.fingerprint_key}
-                onChange={(e) => setGeneral("fingerprint_key", e.target.value)}
-                placeholder="используется только CDP-провайдерами"
-              />
-            </Field>
-            <Field label="Google API (.json)" hint="файл сервисного аккаунта">
-              <input
-                value={settings.general.google_credentials}
-                onChange={(e) => setGeneral("google_credentials", e.target.value)}
-                placeholder="C:\app\creds\service-account.json"
-              />
-            </Field>
-            <Field label="ID Google-таблицы">
-              <input
-                value={settings.general.spreadsheet_id}
-                onChange={(e) => setGeneral("spreadsheet_id", e.target.value)}
-                placeholder="1AbC…"
-              />
-            </Field>
-            <div className="row3">
-              <Field label="Лист заданий">
-                <input value={settings.general.sheet_tasks} onChange={(e) => setGeneral("sheet_tasks", e.target.value)} />
-              </Field>
-              <Field label="Лист аккаунтов">
-                <input
-                  value={settings.general.sheet_accounts}
-                  onChange={(e) => setGeneral("sheet_accounts", e.target.value)}
-                />
-              </Field>
-              <Field label="Лист выкупов">
-                <input
-                  value={settings.general.sheet_orders}
-                  onChange={(e) => setGeneral("sheet_orders", e.target.value)}
-                />
-              </Field>
-            </div>
+            <legend>{section === "proxies" ? "Прокси" : "Доступы и файлы"}</legend>
+            {section === "general" && (
+              <>
+                <Field label="Ключ FingerPrint">
+                  <input
+                    value={settings.general.fingerprint_key}
+                    onChange={(e) => setGeneral("fingerprint_key", e.target.value)}
+                    placeholder="используется только CDP-провайдерами"
+                  />
+                </Field>
+              </>
+            )}
+            {section === "proxies" && (
+              <>
             <Field label="Файл прокси (.txt)" hint="построчно: socks5://user:pass@ip:port">
               <input
                 value={settings.general.proxies_file}
@@ -650,6 +683,149 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
               </span>
             </div>
             <div className="field">
+              <span className="field-label">Прокси LTESpace (API)</span>
+              <Toggle
+                label="Использовать прокси из аккаунта LTESpace"
+                value={settings.ltespace.enabled}
+                onChange={(v) => setLtespace("enabled", v)}
+              />
+              <Field
+                label="API-ключ"
+                hint="Кабинет → Настройки → API. Ключ применяется после «Сохранить»"
+              >
+                <input
+                  type="password"
+                  value={settings.ltespace.api_key}
+                  onChange={(e) => setLtespace("api_key", e.target.value)}
+                  placeholder="ltespace_…"
+                  autoComplete="off"
+                />
+              </Field>
+              <Field
+                label="Файл пула LTESpace"
+                hint="Отдельный файл: прокси, добавленные вручную, не затираются"
+              >
+                <input
+                  value={settings.ltespace.proxies_file}
+                  onChange={(e) => setLtespace("proxies_file", e.target.value)}
+                  placeholder="пусто — %APPDATA%\pf-automation\proxies_ltespace.txt"
+                />
+              </Field>
+              <Field
+                label="Протокол в пуле"
+                hint="http — HTTP CONNECT (годится и для HTTPS), socks5 — SOCKS5"
+              >
+                <select
+                  value={settings.ltespace.protocol}
+                  onChange={(e) =>
+                    setLtespace(
+                      "protocol",
+                      e.target.value as Settings["ltespace"]["protocol"],
+                    )
+                  }
+                >
+                  <option value="http">http</option>
+                  <option value="socks">socks5</option>
+                  <option value="auto">auto (http)</option>
+                </select>
+              </Field>
+              <Toggle
+                label="Обновлять список прокси перед прогоном"
+                value={settings.ltespace.sync_proxies}
+                onChange={(v) => setLtespace("sync_proxies", v)}
+              />
+              <Toggle
+                label="Менять IP при блоке Ozon (приватный тариф)"
+                value={settings.ltespace.rotate_on_block}
+                onChange={(v) => setLtespace("rotate_on_block", v)}
+              />
+              <Toggle
+                label="Новый IP перед каждым прогоном"
+                value={settings.ltespace.rotate_before_run}
+                onChange={(v) => setLtespace("rotate_before_run", v)}
+              />
+              <Toggle
+                label="Капча: остановить прогон, сменить IP и запустить заново"
+                value={settings.ltespace.restart_on_captcha}
+                onChange={(v) => setLtespace("restart_on_captcha", v)}
+              />
+              <Field label="Пауза перед перезапуском, с" hint="0–600">
+                <input
+                  type="number"
+                  min={0}
+                  max={600}
+                  value={settings.ltespace.captcha_restart_delay_sec}
+                  onChange={(e) =>
+                    setLtespace(
+                      "captcha_restart_delay_sec",
+                      Math.max(0, Math.min(600, Number(e.target.value))),
+                    )
+                  }
+                />
+              </Field>
+              <Field label="Лимит автоперезапусков" hint="0 — без ограничений">
+                <input
+                  type="number"
+                  min={0}
+                  max={20}
+                  value={settings.ltespace.captcha_restart_limit}
+                  onChange={(e) =>
+                    setLtespace(
+                      "captcha_restart_limit",
+                      Math.max(0, Math.min(20, Number(e.target.value))),
+                    )
+                  }
+                />
+              </Field>
+              <div className="input-row">
+                <button className="btn" type="button" onClick={loadLtespace} disabled={ltBusy}>
+                  Проверить ключ
+                </button>
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={syncLtespace}
+                  disabled={ltBusy || !settings.ltespace.api_key.trim()}
+                >
+                  Подтянуть прокси
+                </button>
+              </div>
+              {ltStatus && (
+                <div className="hint-block">
+                  {ltStatus.ok
+                    ? `Баланс ${ltStatus.balance ?? 0} ${ltStatus.currency ?? ""} · прокси ${ltStatus.proxies.length}`
+                    : `Ошибка: ${ltStatus.error ?? "неизвестно"}`}
+                  {ltStatus.ok &&
+                    ltStatus.proxies.map((row) => (
+                      <div key={row.port}>
+                        {row.host}:{row.port}
+                        {row.ip ? ` · IP ${row.ip}` : ""} · {row.tariff ?? "—"} ·{" "}
+                        {row.operator ?? "—"} ·{" "}
+                        {row.city ?? "—"} · до {row.expire ?? "—"}
+                        {row.manual_rotation_available && (
+                          <>
+                            {" "}
+                            <button
+                              className="btn"
+                              type="button"
+                              onClick={() => rotateLtespace(row.port)}
+                              disabled={ltBusy}
+                            >
+                              Сменить IP
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    ))}
+                </div>
+              )}
+              <span className="field-hint">
+                Прокси LTESpace попадают в отдельный файл, а потоки берут их как обычный пул.
+                Перед прогоном список обновляется сам; при блоке Ozon IP меняется, если тариф
+                поддерживает ручную ротацию.
+              </span>
+            </div>
+            <div className="field">
               <span className="field-label">Проверка прокси на Ozon</span>
               <div className="input-row">
                 <button
@@ -689,6 +865,7 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                   {problemProxies.slice(0, 12).map((item) => (
                     <div key={item.server}>
                       {item.masked} — {statusText[item.status]}
+                      {item.ip ? ` · IP ${item.ip}` : ""}
                       {item.http ? ` (HTTP ${item.http})` : ""}
                       {item.error ? `: ${item.error}` : ""}
                     </div>
@@ -697,29 +874,12 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                 </div>
               )}
             </div>
-            <div className="field">
-              <span className="field-label">Файл Excel (.xlsx)</span>
-              <div className="input-row">
-                <input
-                  value={settings.general.sheet_xlsx}
-                  onChange={(e) => setGeneral("sheet_xlsx", e.target.value)}
-                  placeholder="C:\Users\…\table_ozon.xlsx"
-                />
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    void pickExcel();
-                  }}
-                >
-                  Выбрать…
-                </button>
-              </div>
-              <span className="field-hint">локальная таблица, если Google не настроен</span>
-            </div>
+              </>
+            )}
           </fieldset>
+          )}
 
+          {section === "profiles" && (
           <fieldset className="panel">
             <legend>Директории профилей</legend>
             <Field label="Активные профили">
@@ -835,8 +995,12 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                 </table>
               </div>
             </div>
+          </fieldset>
+          )}
 
-            <legend className="mt">Параметры запуска</legend>
+          {section === "general" && (
+          <fieldset className="panel">
+            <legend>Параметры запуска</legend>
             <div className="row3">
               <Field label="Потоков">
                 <input
@@ -906,40 +1070,9 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
               </Field>
             </div>
           </fieldset>
+          )}
 
-          <fieldset className="panel">
-            <legend>Синхронизация с таблицей</legend>
-            <div className="hint-block">
-              Режим: {sync?.mode ?? "—"} · push {sync?.last_push ?? "—"} · из листа {sync?.pulled ?? 0},
-              в лист {sync?.pushed ?? 0}
-              {sync?.last_error ? ` · ошибка: ${sync.last_error}` : ""}
-            </div>
-            <Toggle
-              label="Автосинхронизация"
-              value={settings.general.sync_enabled}
-              onChange={(v) => setGeneral("sync_enabled", v)}
-            />
-            <Field label="Интервал, сек" hint="10–600">
-              <input
-                type="number"
-                min={10}
-                max={600}
-                value={settings.general.sync_interval_sec}
-                onChange={(e) => setGeneral("sync_interval_sec", Number(e.target.value))}
-              />
-            </Field>
-            <button className="btn" onClick={onSync} type="button">
-              Синхронизировать сейчас
-            </button>
-            <button className="btn danger" onClick={resetDemo} type="button">
-              Сбросить тестовые данные
-            </button>
-            <div className="field-hint">
-              Без Google-кредов работает тестовая таблица: %APPDATA%\pf-automation\fake_sheet.json
-              (листы ПФ2 / Аккаунты / Выкупы).
-            </div>
-          </fieldset>
-
+          {section === "general" && (
           <fieldset className="panel">
             <legend>Быстрые действия из выдачи / каталога</legend>
             <Toggle
@@ -963,7 +1096,9 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
               onChange={(v) => setQuick("favorite", v)}
             />
           </fieldset>
+          )}
 
+          {section === "browser" && (
           <fieldset className="panel">
             <legend>Браузер</legend>
             <Field label="Провайдер">
@@ -1005,13 +1140,16 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
                 />
               </Field>
               <Field label="Headless">
-                <select
-                  value={settings.browser.headless ? "yes" : "no"}
-                  onChange={(e) => setBrowser("headless", e.target.value === "yes")}
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={settings.browser.headless}
+                  className={settings.browser.headless ? "switch on" : "switch"}
+                  onClick={() => setBrowser("headless", !settings.browser.headless)}
+                  title="Показывать окно браузера"
                 >
-                  <option value="no">Нет</option>
-                  <option value="yes">Да</option>
-                </select>
+                  <i />
+                </button>
               </Field>
             </div>
             <Toggle
@@ -1029,6 +1167,7 @@ export default function SettingsPage({ api, settings, sync, onChange, onNotice, 
               Проверить браузер
             </button>
           </fieldset>
+          )}
         </div>
       ) : (
         <div className="grid">
@@ -1162,10 +1301,15 @@ function Toggle({ label, value, onChange }: { label: string; value: boolean; onC
   return (
     <div className="toggle-row">
       <span>{label}</span>
-      <select value={value ? "yes" : "no"} onChange={(e) => onChange(e.target.value === "yes")}>
-        <option value="yes">Да</option>
-        <option value="no">Нет</option>
-      </select>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={value}
+        className={value ? "switch on" : "switch"}
+        onClick={() => onChange(!value)}
+      >
+        <i />
+      </button>
     </div>
   );
 }

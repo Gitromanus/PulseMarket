@@ -176,6 +176,7 @@ class ProxyCheckManager:
                 await self.bus.log(
                     None,
                     f"Прокси {index}/{len(proxies)} {proxy.masked()}: {item['status']}"
+                    + (f" · IP {item.get('ip')}" if item.get("ip") else "")
                     + (f" ({item['error']})" if item.get("error") else ""),
                     level,
                 )
@@ -210,11 +211,22 @@ class ProxyCheckManager:
             "masked": proxy.masked(),
             "status": "error",
             "http": None,
+            "ip": None,
             "error": None,
             "checked_at": datetime.now().strftime("%H:%M:%S"),
         }
         try:
             session = await provider.open(profile, proxy)
+            try:
+                ip_response = await session.context.request.get(
+                    "https://api.ipify.org?format=json", timeout=10000
+                )
+                if ip_response.ok:
+                    payload = await ip_response.json()
+                    if isinstance(payload, dict) and payload.get("ip"):
+                        item["ip"] = str(payload["ip"])
+            except Exception:  # noqa: BLE001 — IP нужен только для наглядности
+                pass
             if session.hwnd and not settings.browser.headless:
                 # Проверяем в том же режиме, что и рабочий прогон (headed),
                 # но окно прячем, чтобы не мешало оператору.

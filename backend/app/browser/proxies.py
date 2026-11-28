@@ -31,9 +31,12 @@ class Proxy:
         return data
 
     def masked(self) -> str:
-        host = self.server.split("://", 1)[-1]
-        if self.username:
-            return f"{self.server.split('://')[0]}://***:***@{host}"
+        """Адрес прокси без логина/пароля.
+
+        Раньше здесь были звёзды вместо учётных данных, но вместе с ними
+        «прятался» и адрес: оператор не видел, с какого IP работает поток.
+        Показываем ``scheme://host:port``, а внешний IP выводится отдельно.
+        """
         return self.server
 
 
@@ -87,6 +90,17 @@ class ProxyPool:
                 continue
             self.items.append(proxy)
 
+    def keep_ports(self, ports: set[int]) -> int:
+        """Оставляет в пуле только прокси с указанными портами (свежий IP).
+
+        Используется после капчи: продолжаем на уже сменивших IP каналах,
+        не дожидаясь ротации остальных.
+        """
+        self.items[:] = [
+            proxy for proxy in self.items if urlparse(proxy.server).port in ports
+        ]
+        return self.size
+
     @property
     def size(self) -> int:
         return len(self.items)
@@ -121,6 +135,12 @@ class ProxyPool:
             self._busy[chosen.raw] = self._busy.get(chosen.raw, 0) + 1
             return chosen
         return None
+
+    def has_capacity(self, proxy: Proxy | None) -> bool:
+        """Есть ли у прокси свободный слот под ещё один поток."""
+        if proxy is None:
+            return False
+        return self._busy.get(proxy.raw, 0) < max(1, self.max_per_proxy)
 
     def release(self, proxy: Proxy | None) -> None:
         if proxy is None:

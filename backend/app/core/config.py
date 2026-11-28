@@ -87,13 +87,7 @@ class QuickActions(BaseModel):
 
 class GeneralSettings(BaseModel):
     fingerprint_key: str = ""
-    google_credentials: str = ""
-    spreadsheet_id: str = ""
-    sheet_tasks: str = "ПФ2"
-    sheet_accounts: str = "Аккаунты"
-    sheet_orders: str = "Выкупы"
     proxies_file: str = ""
-    sheet_xlsx: str = ""
     dir_active: str = ""
     dir_done: str = ""
     dir_noauth: str = ""
@@ -163,11 +157,30 @@ class LicenseSettings(BaseModel):
     server: str = ""
 
 
+class LtespaceSettings(BaseModel):
+    """Мобильные прокси LTESpace: ключ, файл пула и смена IP при блоке."""
+
+    api_key: str = ""
+    enabled: bool = False
+    # Отдельный файл: ручные прокси из general.proxies_file не затираются.
+    proxies_file: str = ""
+    sync_proxies: bool = True
+    rotate_on_block: bool = True
+    # Менять IP всех прокси с ручной ротацией перед каждым прогоном.
+    rotate_before_run: bool = False
+    # Капча-пазл: сразу остановить прогон, сменить IP и запустить заново.
+    restart_on_captcha: bool = True
+    captcha_restart_delay_sec: int = Field(default=20, ge=0, le=600)
+    captcha_restart_limit: int = Field(default=3, ge=0, le=20)
+    protocol: Literal["http", "socks", "auto"] = "http"
+
+
 class AppSettings(BaseModel):
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     view: ViewSettings = Field(default_factory=ViewSettings)
     browser: BrowserSettings = Field(default_factory=BrowserSettings)
     license: LicenseSettings = Field(default_factory=LicenseSettings)
+    ltespace: LtespaceSettings = Field(default_factory=LtespaceSettings)
 
 
 def load_settings() -> AppSettings:

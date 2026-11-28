@@ -100,7 +100,16 @@ function startBackend(port: number): void {
   const forward = (chunk: Buffer) => console.log("[backend]", chunk.toString().trimEnd());
   child.stdout?.on("data", forward);
   child.stderr?.on("data", forward);
-  child.on("exit", (code) => console.log(`[backend] exited with ${code}`));
+  child.on("exit", (code) => {
+    console.log(`[backend] exited with ${code}`);
+    if (!quitting && code !== 0 && mainWindow) {
+      // Иначе UI остаётся в состоянии «в работе», хотя ядро уже умерло.
+      dialog.showErrorBox(
+        "PulseMarket",
+        `Ядро приложения остановилось (код ${code ?? "?"}). Перезапустите PulseMarket.`,
+      );
+    }
+  });
 }
 
 async function waitForRuntime(port: number, timeoutMs = 30000) {

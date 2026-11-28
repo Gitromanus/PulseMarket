@@ -133,6 +133,75 @@ async def _dismiss_overlays(
             continue
 
 
+async def _confirm_size_dialog(
+    page: Any, bus: EventBus | None = None, thread_id: int | None = None
+) -> bool:
+    """Дожим «В корзину» после модалки «Выберите размер».
+
+    Ozon не кладёт товар в корзину, пока не выбран размер. В модалке размер —
+    это ссылка на вариант товара с ``is_apparel_size_selected=true``: клик
+    переводит на карточку нужного размера, там жмём «В корзину» ещё раз.
+    """
+    try:
+        title = page.locator("text=Выберите размер")
+        if not await title.count():
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+
+    try:
+        modal = page.locator('div[data-widget="modalLayout"]').last
+        links = modal.locator(
+            '[data-widget="universalAspects"] a[href*="is_apparel_size_selected=true"]'
+        )
+        total = await links.count()
+        choices: list[tuple[Any, str]] = []
+        for index in range(total):
+            link = links.nth(index)
+            try:
+                if not await link.is_visible():
+                    continue
+                label = " ".join((await link.inner_text()).split())
+                css = (await link.get_attribute("class")) or ""
+                aria = (await link.get_attribute("aria-disabled")) or ""
+                if "disabled" in css.lower() or aria == "true":
+                    continue
+                choices.append((link, label))
+            except Exception:  # noqa: BLE001
+                continue
+        if not choices:
+            if bus is not None:
+                await bus.log(thread_id, "Модалка размера: нет доступных размеров", "warn")
+            return False
+
+        link, label = random.choice(choices)
+        await human.click(page, link)
+        await human.pause(2.0, 3.5)
+        if bus is not None:
+            await bus.log(thread_id, f"Выбрали размер: {label[:40]}")
+
+        # После выбора размера модалка остаётся: в ней своя кнопка «В корзину».
+        # Кликаем именно её, иначе клик уходит на перекрытую страницу.
+        if await title.count():
+            button = modal.locator('[data-widget="webAddToCart"] button').first
+            if not await button.count():
+                button = modal.get_by_role("button", name="В корзину", exact=False).first
+            await human.click(page, button)
+            await human.pause(1.0, 2.0)
+
+        for _ in range(16):
+            if not await title.count():
+                return True
+            await asyncio.sleep(0.5)
+        return False
+    except Exception as exc:  # noqa: BLE001 — не валим карточку из-за модалки
+        if bus is not None:
+            await bus.log(
+                thread_id, f"Модалка размера: {type(exc).__name__}: {exc}", "warn"
+            )
+        return False
+
+
 async def _wait_card_ready(
     page: Any, bus: EventBus, thread_id: int, timeout: int = 15000
 ) -> None:
@@ -204,6 +273,10 @@ HUMAN_SEARCH = True
 # После одного решения кука ставится и следующие заходы идут без капчи.
 CAPTCHA_MANUAL_WAIT = 300.0
 SLIDER_MARKERS = ("antibot captcha", "составьте пазл", "подтвердите, что вы не бот")
+# Включается из run_ozon по настройке «перезапуск по капче»: пазл не ждём,
+# а сразу отдаём сигнал supervisor — он закроет браузеры, сменит IP и
+# запустит прогон заново.
+ABORT_ON_SLIDER_CAPTCHA = False
 
 
 async def _is_slider_captcha(page: Any) -> bool:
@@ -245,6 +318,21 @@ async def _wait_challenge(
     if not challenge:
         return
     slider = await _is_slider_captcha(page)
+    if slider and ABORT_ON_SLIDER_CAPTCHA:
+        # Не рубим сразу: Ozon иногда сначала отдаёт промежуточный челлендж,
+        # который через несколько секунд сам меняется на выдачу. Заодно
+        # оператор успевает увидеть окно с капчей в превью.
+        for _ in range(5):
+            await asyncio.sleep(1.0)
+            if not await _find_challenge(page):
+                if bus is not None:
+                    await bus.log(thread_id, "Проверка браузера пройдена")
+                return
+            if not await _is_slider_captcha(page):
+                slider = False
+                break
+        if slider:
+            raise ScenarioError("ozon_captcha", f"капча-пазл Ozon ({where})")
     if slider and timeout < CAPTCHA_MANUAL_WAIT:
         timeout = CAPTCHA_MANUAL_WAIT
     was_visible = bool(session.visible) if session is not None else True
@@ -762,6 +850,11 @@ async def run_ozon(
     page = session.page
     page.set_default_timeout(15000)
 
+    global ABORT_ON_SLIDER_CAPTCHA
+    ABORT_ON_SLIDER_CAPTCHA = bool(
+        settings.ltespace.enabled and settings.ltespace.restart_on_captcha
+    )
+
     view = settings.view
     steps: list[dict[str, Any]] = []
     started = time.monotonic()
@@ -896,9 +989,19 @@ async def run_ozon(
 
         cart = 0
         if _chance(view.cart_pct):
+            # Cookie-баннер может всплыть уже на карточке и перекрыть кнопку.
+            await _dismiss_overlays(page, bus, thread_id)
             if await _click_optional(registry, page, "add_to_cart", "Корзина", bus, thread_id):
-                cart = 1
-                mark("cart")
+                added = await _confirm_size_dialog(page, bus, thread_id)
+                if added:
+                    cart = 1
+                    mark("cart")
+                else:
+                    await bus.log(
+                        thread_id,
+                        "Корзина: модалка «Выберите размер» не закрылась",
+                        "warn",
+                    )
 
         elapsed = time.monotonic() - started
         remaining = total_dwell - elapsed
